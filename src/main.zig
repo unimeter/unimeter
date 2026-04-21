@@ -32,6 +32,9 @@ pub fn main(init: std.process.Init) !void {
         const n = @min(addr.len, server.ADDR_LEN - 1);
         @memcpy(cfg.node_addrs[cfg.node_id][0..n], addr[0..n]);
     }
+    if (init.environ_map.get("RETENTION_DAYS")) |d| {
+        cfg.retention_days = std.fmt.parseInt(u32, d, 10) catch 90;
+    }
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // skip argv[0]

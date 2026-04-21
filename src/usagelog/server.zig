@@ -403,6 +403,9 @@ var g_memtable_init: bool = false;
 var g_unique_sets: UniqueSets = undefined;
 var g_alert_log: alert_mod.AlertLog = undefined;
 var g_agg_worker: AggWorker = undefined;
+/// Highest event offset that has been applied to aggregates.
+/// Used by retention sweep to avoid deleting unprocessed segments.
+var g_last_agg_offset: u64 = 0;
 
 fn make_listen_fd(port: u16) !posix.fd_t {
     const fd = try net_io.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
@@ -464,6 +467,7 @@ pub fn run(alloc: std.mem.Allocator, cfg: ServerConfig) !void {
         .alert_push_ctx = &io,
     };
     g_memtable_init = true;
+    g_last_agg_offset = log.offset; // all existing events are aggregated at startup
 
     g_node_id = cfg.node_id;
     const n_nodes: u8 = if (cfg.peers.len == 0) 1 else @intCast(cfg.peers.len + 1);
@@ -570,7 +574,16 @@ pub fn run(alloc: std.mem.Allocator, cfg: ServerConfig) !void {
             .send    => try handle_send(&io, fd, cqe.res),
             .alert_push => {}, // fire-and-forget; completion must not touch conn state
             .connect => {},
-            .signal  => begin_shutdown(&io, ingest_fd),
+            .signal  => {
+                if (cqe.res > 0) {
+                    begin_shutdown(&io, ingest_fd);
+                } else {
+                    // Spurious wakeup or error — re-queue the read.
+                    if (g_signal_fd >= 0) {
+                        io.queue_recv(encode(.signal, g_signal_fd), g_signal_fd, &g_signal_buf) catch {};
+                    }
+                }
+            },
             .timeout => {
                 if (!g_shutting_down) {
                     tick_all_partitions();
@@ -1717,6 +1730,11 @@ fn finish_ingest_batch(conn: *Conn) void {
                 conn,
                 conn_props_of,
             ) catch {};
+            // Track highest offset applied to aggregates for retention safety.
+            const last_evt = conn.events_buf[b.n_events - 1];
+            if (last_evt.offset >= g_last_agg_offset) {
+                g_last_agg_offset = last_evt.offset + 1;
+            }
         }
     }
     if (b.result.n_duplicates > 0) metrics.events_duplicate.add(b.result.n_duplicates);
@@ -1922,24 +1940,31 @@ fn maybe_retention_sweep(alloc: std.mem.Allocator) void {
         if (name.len < 4) continue;
         if (!std.mem.eql(u8, name[name.len - 4 ..], ".seg")) continue;
 
-        // Read first event timestamp to check age.
         var seg_path_buf: [512]u8 = undefined;
         const seg_path = std.fmt.bufPrint(&seg_path_buf, "{s}/{s}", .{ g_data_dir, name }) catch continue;
+        const base = name[0 .. name.len - 4]; // strip ".seg"
+
+        // Safety guard: never delete segments that AggWorker hasn't processed.
+        const seg_base_offset = std.fmt.parseInt(u64, base, 10) catch continue;
 
         const f = disk_io.open_ro(seg_path) catch continue;
+        const file_size = f.size() catch { f.close(); continue; };
         var evt: Event = undefined;
         const n = f.read(std.mem.asBytes(&evt)) catch { f.close(); continue; };
         f.close();
         if (n != @sizeOf(Event)) continue;
 
-        if (evt.timestamp < cutoff_ns) {
-            // Delete segment, index, and props files.
-            disk_io.remove(seg_path) catch {};
+        // Only delete if all events in this segment have been aggregated.
+        const seg_end_offset = seg_base_offset + file_size / @sizeOf(Event);
+        if (seg_end_offset > g_last_agg_offset) continue;
 
-            // Replace .seg with .idx / .props for companion files.
+        // Check age: first event timestamp must be older than cutoff.
+        if (evt.timestamp >= cutoff_ns) continue;
+
+        {
+            disk_io.remove(seg_path) catch {};
             var idx_buf: [512]u8 = undefined;
             var props_buf: [512]u8 = undefined;
-            const base = name[0 .. name.len - 4]; // strip ".seg"
             const idx_path = std.fmt.bufPrint(&idx_buf, "{s}/{s}.idx", .{ g_data_dir, base }) catch continue;
             const props_path = std.fmt.bufPrint(&props_buf, "{s}/{s}.props", .{ g_data_dir, base }) catch continue;
             disk_io.remove(idx_path) catch {};
@@ -1963,10 +1988,10 @@ fn maybe_retention_sweep(alloc: std.mem.Allocator) void {
         const cutoff_period: u32 = @min(cutoff_fixed, cutoff_cal);
         checkpoint.evict_closed_periods(&g_memtable, &g_unique_sets, cutoff_period);
 
-        // Save checkpoint after eviction.
+        // Save checkpoint after eviction with correct offset for recovery.
         var ckpt_buf: [512]u8 = undefined;
         const ckpt = std.fmt.bufPrint(&ckpt_buf, "{s}/checkpoint.bin", .{g_data_dir}) catch return;
-        checkpoint.save(alloc, &g_memtable, 0, ckpt) catch |err| {
+        checkpoint.save(alloc, &g_memtable, g_last_agg_offset, ckpt) catch |err| {
             std.log.err("retention: checkpoint save failed: {}", .{err});
         };
     }

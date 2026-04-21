@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
+    b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run benchmarks");
