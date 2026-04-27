@@ -489,6 +489,7 @@ pub fn run(alloc: std.mem.Allocator, cfg: ServerConfig) !void {
         const b: u8 = @intCast((p.addr_be >> 16) & 0xFF);
         const c: u8 = @intCast((p.addr_be >> 8)  & 0xFF);
         const d: u8 = @intCast(p.addr_be & 0xFF);
+        @memset(&g_cfg.node_addrs[p.node_id], 0);
         _ = std.fmt.bufPrint(&g_cfg.node_addrs[p.node_id],
             "{d}.{d}.{d}.{d}:{d}", .{ a, b, c, d, ingest_port }) catch {};
     }
@@ -587,6 +588,7 @@ pub fn run(alloc: std.mem.Allocator, cfg: ServerConfig) !void {
             .timeout => {
                 if (!g_shutting_down) {
                     tick_all_partitions();
+                    maybe_peer_reconnect();
                     maybe_retention_sweep(alloc);
                     queue_tick_timeout(&io) catch {};
                 }
@@ -1913,6 +1915,20 @@ var g_tick_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 100_000_000 };
 
 fn queue_tick_timeout(io: *RealIO) !void {
     try io.queue_timeout(encode(.timeout, 0), &g_tick_ts);
+}
+
+// ---- Peer reconnect ----
+
+/// Tick counter for peer reconnect. At 100ms per tick, 50 = 5 seconds.
+var g_reconnect_tick: u32 = 0;
+const RECONNECT_TICKS: u32 = 50;
+
+fn maybe_peer_reconnect() void {
+    if (!g_vsr_init) return;
+    g_reconnect_tick += 1;
+    if (g_reconnect_tick < RECONNECT_TICKS) return;
+    g_reconnect_tick = 0;
+    g_peer_pool.connect_all() catch {};
 }
 
 // ---- Data retention ----
