@@ -18,7 +18,9 @@ pub const OpTag = enum(u32) {
     connect    = 5, // async TCP connect to a peer node
     timeout    = 6, // periodic timer for view-change tick (fd=0 in user_data)
     alert_push = 7, // server-initiated broadcast; completion should not touch conn state machine
-    signal     = 8, // signalfd read; used for graceful shutdown
+    signal     = 8,  // signalfd read; used for graceful shutdown
+    sync_group_timeout = 9,  // group commit delay expired
+    sync_group_fsync   = 10, // group fsync completion (WAL or segment)
 };
 
 pub fn encode(tag: OpTag, fd: i32) u64 {

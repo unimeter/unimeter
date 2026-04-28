@@ -115,6 +115,7 @@ const ConnState = enum {
     fsyncing_wal,
     writing_seg,
     fsyncing_seg,
+    waiting_group_fsync, // queued for group commit
     sending_resp,
 };
 
@@ -397,6 +398,31 @@ var g_data_dir: []const u8 = "data";
 // Allocator saved from run() for handlers that need it.
 var g_alloc: std.mem.Allocator = undefined;
 
+// ---- Group commit (server-side sync batching) ----
+// When SYNC_GROUP_DELAY_US > 0, sync writes are collected and fsynced together.
+// This amortizes the fsync cost across multiple concurrent requests.
+// Delay of 0 disables group commit (default, backwards-compatible).
+
+/// Max connections that can wait in the sync queue simultaneously.
+const SYNC_QUEUE_CAP: usize = MAX_CONNS;
+/// FDs of connections waiting for group fsync.
+var g_sync_queue: [SYNC_QUEUE_CAP]i32 = [_]i32{-1} ** SYNC_QUEUE_CAP;
+var g_sync_queue_len: usize = 0;
+/// Group commit delay in nanoseconds (0 = disabled). Set from SYNC_GROUP_DELAY_US env.
+var g_sync_group_delay_ns: i64 = 0;
+/// Whether a group fsync timeout is already queued in io_uring.
+var g_sync_timeout_armed: bool = false;
+/// Timeout spec for group commit. Rewritten each time we arm.
+var g_sync_timeout_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 };
+/// Whether a group fsync is currently in-flight (WAL or segment).
+var g_sync_fsync_inflight: bool = false;
+/// Phase of the group fsync: false = WAL phase, true = segment phase.
+var g_sync_fsync_seg_phase: bool = false;
+
+pub fn set_sync_group_delay(us: u32) void {
+    g_sync_group_delay_ns = @as(i64, @intCast(us)) * 1000;
+}
+
 // ---- AggStore in-memory state ----
 var g_memtable: Memtable = undefined;
 var g_memtable_init: bool = false;
@@ -592,6 +618,14 @@ pub fn run(alloc: std.mem.Allocator, cfg: ServerConfig) !void {
                     maybe_retention_sweep(alloc);
                     queue_tick_timeout(&io) catch {};
                 }
+            },
+            .sync_group_timeout => {
+                if (!g_shutting_down) {
+                    sync_group_fire(&io, &log) catch {};
+                }
+            },
+            .sync_group_fsync => {
+                sync_group_on_fsync(&io, &log) catch {};
             },
         }
         _ = try io.submit();
@@ -793,7 +827,8 @@ fn handle_recv(io: *RealIO, log: *UsageLog, fd: i32, res: i32) !void {
             conn.packet_type = @enumFromInt(conn.hdr.packet_type);
             conn.request_id  = conn.hdr.request_id;
 
-            // Resolve partition for ingest: check leadership and possibly redirect.
+            // Resolve partition: use the explicit partition from the header.
+            // SDK groups events by partition and sets this field. 0xFFFF = partition 0 (single-node compat).
             const partition_id: u16 = if (conn.hdr.partition == 0xFFFF) 0
                 else conn.hdr.partition;
             conn.partition_id = partition_id;
@@ -1085,9 +1120,14 @@ fn handle_write(io: *RealIO, log: *UsageLog, fd: i32, res: i32) !void {
             metrics.wal_offset_bytes.set(@intCast(log.wal.write_offset));
 
             if (conn.sync_mode) {
-                conn.state          = .fsyncing_wal;
-                conn.fsync_start_ns = @truncate(time_util.wallNanos());
-                try io.queue_fsync(encode(.fsync, fd), log.wal.file.fd());
+                if (g_sync_group_delay_ns > 0) {
+                    // Group commit: defer fsync, write segment first.
+                    try queue_seg_write(io, log, conn);
+                } else {
+                    conn.state          = .fsyncing_wal;
+                    conn.fsync_start_ns = @truncate(time_util.wallNanos());
+                    try io.queue_fsync(encode(.fsync, fd), log.wal.file.fd());
+                }
             } else {
                 try queue_seg_write(io, log, conn);
             }
@@ -1097,9 +1137,14 @@ fn handle_write(io: *RealIO, log: *UsageLog, fd: i32, res: i32) !void {
             log.segment.advance(conn.batch.n_events);
 
             if (conn.sync_mode) {
-                conn.state          = .fsyncing_seg;
-                conn.fsync_start_ns = @truncate(time_util.wallNanos());
-                try io.queue_fsync(encode(.fsync, fd), log.segment.file.fd());
+                if (g_sync_group_delay_ns > 0) {
+                    // Group commit: enqueue for batched fsync.
+                    try sync_queue_push(io, conn);
+                } else {
+                    conn.state          = .fsyncing_seg;
+                    conn.fsync_start_ns = @truncate(time_util.wallNanos());
+                    try io.queue_fsync(encode(.fsync, fd), log.segment.file.fd());
+                }
             } else {
                 finish_ingest_batch(conn);
                 try queue_send_resp(io, conn);
@@ -1770,6 +1815,65 @@ fn queue_send_resp(io: *RealIO, conn: *Conn) !void {
 fn send_error(io: *RealIO, conn: *Conn) !void {
     write_resp_hdr(conn, .err, 0);
     try queue_send_resp(io, conn);
+}
+
+// ---- Group commit ----
+
+fn sync_queue_push(io: *RealIO, conn: *Conn) !void {
+    conn.state = .waiting_group_fsync;
+    conn.fsync_start_ns = @truncate(time_util.wallNanos());
+    g_sync_queue[g_sync_queue_len] = conn.fd;
+    g_sync_queue_len += 1;
+
+    // Arm the group timeout if not already armed and no fsync in flight.
+    if (!g_sync_timeout_armed and !g_sync_fsync_inflight) {
+        g_sync_timeout_ts = .{ .sec = 0, .nsec = @intCast(g_sync_group_delay_ns) };
+        try io.queue_timeout(encode(.sync_group_timeout, 0), &g_sync_timeout_ts);
+        g_sync_timeout_armed = true;
+    }
+}
+
+fn sync_group_fire(io: *RealIO, log: *UsageLog) !void {
+    if (g_sync_queue_len == 0 or g_sync_fsync_inflight) return;
+    g_sync_timeout_armed = false;
+    g_sync_fsync_inflight = true;
+    g_sync_fsync_seg_phase = false;
+    // Single fsync for WAL — covers all queued writes.
+    try io.queue_fsync(encode(.sync_group_fsync, 0), log.wal.file.fd());
+}
+
+fn sync_group_on_fsync(io: *RealIO, log: *UsageLog) !void {
+    if (!g_sync_fsync_seg_phase) {
+        // WAL fsync done, now fsync segment.
+        g_sync_fsync_seg_phase = true;
+        try io.queue_fsync(encode(.sync_group_fsync, 0), log.segment.file.fd());
+        return;
+    }
+
+    // Both fsyncs done. Complete all queued connections.
+    g_sync_fsync_inflight = false;
+    const n = g_sync_queue_len;
+    for (g_sync_queue[0..n]) |fd| {
+        const conn = conn_get(fd) orelse continue;
+        if (conn.state != .waiting_group_fsync) continue;
+
+        const now: i64 = @truncate(time_util.wallNanos());
+        const fsync_dur: u64 = @intCast(@max(0, now - conn.fsync_start_ns));
+        metrics.wal_syncs.inc();
+        metrics.wal_sync_duration.observe(fsync_dur);
+
+        finish_ingest_batch(conn);
+        send_prepare_to_replicas(conn) catch {};
+        queue_send_resp(io, conn) catch {};
+    }
+    g_sync_queue_len = 0;
+
+    // If new requests arrived while fsync was in-flight, fire again.
+    // (They were pushed to the queue but couldn't arm a timeout because
+    // g_sync_fsync_inflight was true.)
+    if (g_sync_queue_len > 0) {
+        try sync_group_fire(io, log);
+    }
 }
 
 fn send_redirect(io: *RealIO, conn: *Conn, leader_id: NodeId) !void {
