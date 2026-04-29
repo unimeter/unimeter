@@ -18,9 +18,7 @@ pub const OpTag = enum(u32) {
     connect    = 5, // async TCP connect to a peer node
     timeout    = 6, // periodic timer for view-change tick (fd=0 in user_data)
     alert_push = 7, // server-initiated broadcast; completion should not touch conn state machine
-    signal     = 8,  // signalfd read; used for graceful shutdown
-    sync_group_timeout = 9,  // group commit delay expired
-    sync_group_fsync   = 10, // group fsync completion (WAL or segment)
+    signal     = 8, // signalfd read; used for graceful shutdown
 };
 
 pub fn encode(tag: OpTag, fd: i32) u64 {
@@ -41,9 +39,10 @@ pub const RealIO = struct {
     // Zig 0.15: IO_Uring → IoUring
     ring: linux.IoUring,
 
-    // Zig 0.15: init takes u16, not u13
     pub fn init(queue_depth: u16) !RealIO {
-        return .{ .ring = try linux.IoUring.init(queue_depth, 0) };
+        return .{ .ring = try linux.IoUring.init(queue_depth,
+            linux.IORING_SETUP_SINGLE_ISSUER |
+            linux.IORING_SETUP_COOP_TASKRUN) };
     }
 
     pub fn deinit(self: *RealIO) void {
@@ -68,8 +67,9 @@ pub const RealIO = struct {
         _ = try self.ring.write(user_data, fd, buf, offset);
     }
 
+    /// Queue fdatasync (skips metadata flush, faster than full fsync).
     pub fn queue_fsync(self: *RealIO, user_data: u64, fd: posix.fd_t) !void {
-        _ = try self.ring.fsync(user_data, fd, 0);
+        _ = try self.ring.fsync(user_data, fd, linux.IORING_FSYNC_DATASYNC);
     }
 
     /// Queue a one-shot timeout. CQE fires after `ts` elapses with res == -ETIME.
