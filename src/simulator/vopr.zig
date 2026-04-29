@@ -158,6 +158,9 @@ fn run_simulation(
         // AggStore consistency checks.
         checker.check_agg(&ref, &c);
 
+        // WAL durability: every committed event must be recoverable from WAL bytes.
+        checker.check_wal(&c, alloc);
+
         if ((i + 1) % PROGRESS_EVERY == 0) {
             try out.print("  [seed={d}] {d}/{d} ok\n", .{ seed, i + 1, iterations });
             try out.flush();

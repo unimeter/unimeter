@@ -97,6 +97,13 @@ pub const Checker = struct {
         self.assert(check_i7(ref), "I_7: FilteredSumMismatch");
     }
 
+    /// WAL durability check: recover WAL bytes and verify all committed events are present.
+    /// Skipped if disk corruption chaos was applied (corrupt breaks WAL by design).
+    pub fn check_wal(self: *const Checker, c: *const VirtualCluster, alloc: std.mem.Allocator) void {
+        if (c.wal_corrupted) return;
+        self.assert(check_wal_recovery(c, alloc), "I_WAL: WalEventsMissing");
+    }
+
     fn assert(self: *const Checker, result: InvariantError!void, label: []const u8) void {
         result catch |err| {
             std.debug.panic(
@@ -118,6 +125,8 @@ pub const InvariantError = error{
     SumMismatch,
     UniqueCountMismatch,
     FilteredSumMismatch,
+    WalEventsMissing,
+    WalEventsCorrupted,
 };
 
 // ---- Individual invariant functions ----
@@ -687,4 +696,66 @@ test "invariants: AggRef I_7 detects filtered sum mismatch" {
     try ref.raw_filtered_sums.put(fkey, 2_000_000); // disagree
 
     try std.testing.expectError(error.FilteredSumMismatch, check_i7(&ref));
+}
+
+// ---- I_WAL: WAL recovery invariant ----
+//
+// For each partition, recover all events from the leader's WAL bytes and
+// verify that every committed event is present. This catches:
+//   - CRC chain corruption
+//   - Truncated entries
+//   - Missing events (e.g. lost during segment rotation)
+
+const wal_mod = @import("../usagelog/wal.zig");
+const fake_io = @import("../io/fake_io.zig");
+const Event   = @import("../event.zig").Event;
+
+fn check_wal_recovery(c: *const VirtualCluster, alloc: std.mem.Allocator) InvariantError!void {
+    for (0..SIM_PARTITIONS) |p| {
+        const committed = c.committed_events[p].items;
+        if (committed.len == 0) continue;
+
+        // Recover events from the shared WAL for this partition.
+        const wal_bytes = c.wals[p].file.bytes();
+        if (wal_bytes.len == 0) {
+            if (committed.len > 0) return error.WalEventsMissing;
+            continue;
+        }
+
+        var all_wal_events: std.ArrayList(Event) = .empty;
+        defer all_wal_events.deinit(alloc);
+
+        const entries = wal_mod.recover_bytes(wal_bytes, alloc) catch
+            return error.WalEventsCorrupted;
+        defer {
+            for (entries) |e| alloc.free(e.payload);
+            alloc.free(entries);
+        }
+
+        for (entries) |entry| {
+            if (entry.entry_type != .commit) continue;
+            if (entry.payload.len % @sizeOf(Event) != 0) continue;
+            const n_events = entry.payload.len / @sizeOf(Event);
+            const events_ptr: [*]const Event = @ptrCast(@alignCast(entry.payload.ptr));
+            for (0..n_events) |j| {
+                all_wal_events.append(alloc, events_ptr[j]) catch
+                    return error.WalEventsCorrupted;
+            }
+        }
+
+        // Every committed event must exist somewhere in the combined WALs.
+        for (committed) |ref_ev| {
+            var found = false;
+            for (all_wal_events.items) |wal_ev| {
+                if (wal_ev.offset == ref_ev.offset and
+                    wal_ev.account_id == ref_ev.account_id and
+                    wal_ev.value == ref_ev.value)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.WalEventsMissing;
+        }
+    }
 }

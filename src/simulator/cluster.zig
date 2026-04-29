@@ -45,9 +45,8 @@ pub const VirtualNode = struct {
     id:    u8,
     alive: bool,
     vsr:   [SIM_PARTITIONS]VsrPartition,
-    wals:  [SIM_PARTITIONS]fake_io.FakeWal,
 
-    pub fn init(alloc: std.mem.Allocator, id: u8) !VirtualNode {
+    pub fn init(id: u8) VirtualNode {
         var self: VirtualNode = undefined;
         self.id    = id;
         self.alive = true;
@@ -69,16 +68,11 @@ pub const VirtualNode = struct {
                 .n_nodes       = SIM_NODES,
                 .replica_group = rg,
             }, role);
-            self.wals[p] = try fake_io.fake_wal_create(alloc);
         }
         return self;
     }
 
-    pub fn deinit(self: *VirtualNode) void {
-        for (0..SIM_PARTITIONS) |p| {
-            self.wals[p].deinit();
-        }
-    }
+    pub fn deinit(_: *VirtualNode) void {}
 };
 
 // ---- Virtual cluster ----
@@ -90,6 +84,10 @@ pub const VirtualCluster = struct {
     now_ns:            i64,
     /// Per-partition list of successfully committed events, in commit order.
     committed_events:  [SIM_PARTITIONS]std.ArrayList(Event),
+    /// Shared WAL per partition — all leaders write to the same WAL.
+    wals:              [SIM_PARTITIONS]fake_io.FakeWal,
+    /// Set to true when corrupt_disk_write chaos action fires. Disables I_WAL check.
+    wal_corrupted:     bool,
     // Chaos state (all zero/false = no chaos).
     chaos_rng:         std.Random.DefaultPrng,
     drop_probability:  f32,           // 0.0–1.0 fraction of messages randomly dropped
@@ -99,16 +97,20 @@ pub const VirtualCluster = struct {
     pub fn init(alloc: std.mem.Allocator, seed: u64) !VirtualCluster {
         var nodes: [SIM_NODES]VirtualNode = undefined;
         for (0..SIM_NODES) |i| {
-            nodes[i] = try VirtualNode.init(alloc, @intCast(i));
+            nodes[i] = VirtualNode.init(@intCast(i));
         }
         var committed_events: [SIM_PARTITIONS]std.ArrayList(Event) = undefined;
         for (0..SIM_PARTITIONS) |p| committed_events[p] = .empty;
+        var wals: [SIM_PARTITIONS]fake_io.FakeWal = undefined;
+        for (0..SIM_PARTITIONS) |p| wals[p] = try fake_io.fake_wal_create(alloc);
         return .{
             .alloc             = alloc,
             .nodes             = nodes,
             .inbox             = .empty,
             .now_ns            = 0,
             .committed_events  = committed_events,
+            .wals              = wals,
+            .wal_corrupted     = false,
             .chaos_rng         = std.Random.DefaultPrng.init(seed),
             .drop_probability  = 0,
             .partitioned       = false,
@@ -120,6 +122,7 @@ pub const VirtualCluster = struct {
         for (&self.nodes) |*n| n.deinit();
         self.inbox.deinit(self.alloc);
         for (&self.committed_events) |*list| list.deinit(self.alloc);
+        for (&self.wals) |*w| w.deinit();
     }
 
     // ---- Time ----
@@ -203,8 +206,8 @@ pub const VirtualCluster = struct {
         switch (env.msg) {
             .prepare => |msg| {
                 if (node.vsr[p].role != .replica) return;
-                // Use WAL CRC as the wal_crc proof (no actual write in the simulator).
-                const wal_crc = node.wals[p].last_crc;
+                // Use shared WAL CRC as the wal_crc proof.
+                const wal_crc = self.wals[p].last_crc;
                 const ok = node.vsr[p].on_prepare(&msg, wal_crc) orelse return;
                 node.vsr[p].last_ping_ns = self.now_ns;
                 const leader_id = node.vsr[p].leader_node(msg.header.view_number);
@@ -422,6 +425,9 @@ pub const VirtualCluster = struct {
         // Single-node fast path.
         if (leader.vsr[partition].commit_if_no_replicas() != null) {
             for (events) |e| try self.committed_events[partition].append(self.alloc, e);
+            // Write to shared WAL for recovery invariant.
+            const payload = std.mem.sliceAsBytes(events);
+            try self.wals[partition].append(.commit, payload);
             return true;
         }
 
@@ -441,6 +447,9 @@ pub const VirtualCluster = struct {
         const committed = leader.vsr[partition].commit_number > before;
         if (committed) {
             for (events) |e| try self.committed_events[partition].append(self.alloc, e);
+            // Write to shared WAL for recovery invariant.
+            const payload = std.mem.sliceAsBytes(events);
+            try self.wals[partition].append(.commit, payload);
         }
         return committed;
     }

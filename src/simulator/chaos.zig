@@ -182,22 +182,14 @@ pub fn heal_network(c: *VirtualCluster) void {
 /// Flip a random byte in a random WAL to simulate a torn write or bit rot.
 /// Only affects alive nodes that have non-empty WALs.
 pub fn corrupt_disk_write(c: *VirtualCluster, rng: Rng) void {
-    // Collect alive nodes.
-    var buf: [cluster.SIM_NODES]u8 = undefined;
-    var n: usize = 0;
-    for (0..cluster.SIM_NODES) |i| {
-        if (c.nodes[i].alive) { buf[n] = @intCast(i); n += 1; }
-    }
-    if (n == 0) return;
-
-    const node_id: usize = buf[rng.uintLessThan(usize, n)];
-    const p        = rng.uintLessThan(u32, cluster.SIM_PARTITIONS);
-    const wal_data = c.nodes[node_id].wals[p].file.bytes();
+    const p = rng.uintLessThan(u32, cluster.SIM_PARTITIONS);
+    const wal_data = c.wals[p].file.bytes();
     if (wal_data.len == 0) return;
 
     const pos:  usize = rng.uintLessThan(usize, wal_data.len);
     const mask: u8    = rng.int(u8);
-    c.nodes[node_id].wals[p].file.corrupt(pos, mask);
+    c.wals[p].file.corrupt(pos, mask);
+    c.wal_corrupted = true;
 }
 
 /// Graceful shutdown of a random alive node: drain pending, crash, restart.
@@ -353,20 +345,18 @@ test "chaos: corrupt_disk_write flips a byte" {
     var c = try VirtualCluster.init(alloc, 1);
     defer c.deinit();
 
-    // Write bytes directly to node0/partition0 FakeFile so there is data to corrupt.
-    try c.nodes[0].wals[0].file.write_all("DEADBEEFCAFE0000");
+    // Write bytes directly to shared partition 0 WAL so there is data to corrupt.
+    try c.wals[0].file.write_all("DEADBEEFCAFE0000");
 
-    const before_len = c.nodes[0].wals[0].file.bytes().len;
+    const before_len = c.wals[0].file.bytes().len;
     try std.testing.expect(before_len > 0);
 
-    // Use a seeded RNG: seed=0 deterministically picks the same node/partition/pos.
-    // With only node0 having WAL data and all nodes alive, the result is predictable.
     var prng = std.Random.DefaultPrng.init(0);
     const rng = prng.random();
     corrupt_disk_write(&c, rng);
 
     // Length is unchanged; only content may differ.
-    try std.testing.expectEqual(before_len, c.nodes[0].wals[0].file.bytes().len);
+    try std.testing.expectEqual(before_len, c.wals[0].file.bytes().len);
 }
 
 test "chaos: pick_action covers all tags" {
