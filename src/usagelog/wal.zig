@@ -235,11 +235,8 @@ fn open_wal_segment(dir: []const u8, index: u32, segment_size: u64, prev_crc: u3
     const data_size = if (sz > segment_size) segment_size else sz;
     _ = data_size;
 
-    // For a fresh segment, start at offset 0.
-    // For existing segment, we need to find the actual data end.
-    // The file was pre-allocated so size() returns segment_size, not data size.
-    // We'll handle this in wal_open_segmented by scanning the last segment.
-    try rf.seek_end();
+    // New segment: write from offset 0 (file is pre-allocated with zeros).
+    try rf.seek_to(0);
     var wal = Wal.init_with_file(rf, 0);
     wal.last_crc = prev_crc;
     return wal;
@@ -475,6 +472,10 @@ pub fn recover_bytes(data: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntr
         var header: EntryHeader = undefined;
         @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
         if (header.prev_crc != prev_crc) break; // chain broken
+
+        // Validate entry_type before converting (pre-allocated files contain zeros).
+        const entry_type = std.enums.fromInt(EntryType, header.entry_type) orelse break;
+
         pos += @sizeOf(EntryHeader);
 
         if (pos + header.payload_len > data.len) break; // truncated payload
@@ -491,7 +492,7 @@ pub fn recover_bytes(data: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntr
         pos += header.payload_len;
 
         try entries.append(alloc, .{
-            .entry_type = @enumFromInt(header.entry_type),
+            .entry_type = entry_type,
             .payload    = payload,
         });
     }
@@ -590,4 +591,103 @@ test "wal: recover_bytes stops at corrupted entry" {
     // Only entry 1 should survive.
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqualSlices(u8, "hello", entries[0].payload);
+}
+
+test "segmented wal: rotation and CRC chain across segments" {
+    const dir = "/tmp/billing_segwal_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    // Tiny segment size (512 bytes) to force rotation quickly.
+    const seg_size: u64 = 512;
+
+    // Write entries that will span multiple segments.
+    // Each entry = 16B header + payload. "payload_XX" = 10B → entry = 26B.
+    // 512 / 26 ≈ 19 entries per segment.
+    const n_entries: usize = 80; // should produce ~4 segments
+
+    {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+
+        for (0..n_entries) |i| {
+            var payload: [10]u8 = undefined;
+            _ = std.fmt.bufPrint(&payload, "payload_{d:0>2}", .{i}) catch unreachable;
+            try wal.append(.commit, &payload);
+        }
+        try wal.sync();
+
+        // Verify multiple segments were created.
+        try std.testing.expect(wal.segment_index >= 3);
+    }
+
+    // Recovery: all entries must come back in order with valid CRC chain.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(n_entries, entries.len);
+
+    // Verify first and last entries.
+    try std.testing.expectEqualSlices(u8, "payload_00", entries[0].payload);
+
+    var last_buf: [10]u8 = undefined;
+    _ = std.fmt.bufPrint(&last_buf, "payload_{d:0>2}", .{n_entries - 1}) catch unreachable;
+    try std.testing.expectEqualSlices(u8, &last_buf, entries[n_entries - 1].payload);
+}
+
+test "segmented wal: reopen preserves CRC chain" {
+    const dir = "/tmp/billing_segwal_reopen_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    const seg_size: u64 = 512;
+
+    // Write some entries, close, reopen, write more.
+    {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+        try wal.append(.commit, "before_close");
+        try wal.sync();
+    }
+
+    {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+        try wal.append(.commit, "after_reopen");
+        try wal.sync();
+    }
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualSlices(u8, "before_close", entries[0].payload);
+    try std.testing.expectEqualSlices(u8, "after_reopen", entries[1].payload);
+}
+
+test "segmented wal: empty dir returns empty recovery" {
+    const dir = "/tmp/billing_segwal_empty_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+    disk_io.make_path(dir) catch {};
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    const entries = try recover_segmented(dir, gpa.allocator());
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
