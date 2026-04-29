@@ -35,43 +35,25 @@ pub fn validate(alloc: std.mem.Allocator, data_dir: []const u8) !ValidateResult 
     try check_writable(data_dir);
     log.info("data directory OK: {s}", .{data_dir});
 
-    // 2. WAL CRC chain validation.
-    var wal_path_buf: [512]u8 = undefined;
-    const wal_path = try std.fmt.bufPrint(&wal_path_buf, "{s}/wal.log", .{data_dir});
+    // 2. WAL CRC chain validation (segmented WAL directory).
+    var wal_dir_buf: [512]u8 = undefined;
+    const wal_dir = try std.fmt.bufPrint(&wal_dir_buf, "{s}/wal", .{data_dir});
 
-    const wal_file = disk_io.open_ro(wal_path) catch |err| switch (err) {
+    const entries = wal_mod.recover_segmented(wal_dir, alloc) catch |err| switch (err) {
         error.FileNotFound => {
             log.info("no WAL found, fresh start", .{});
             return result;
         },
         else => return err,
     };
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+    result.wal_entries = entries.len;
 
-    const wal_size = try wal_file.size();
-    wal_file.close();
-
-    if (wal_size > 0) {
-        const entries = try wal_mod.recover(wal_path, alloc);
-        defer {
-            for (entries) |e| alloc.free(e.payload);
-            alloc.free(entries);
-        }
-        result.wal_entries = entries.len;
-
-        // Check if WAL was truncated (file has trailing bytes after last valid entry).
-        var expected_size: u64 = 0;
-        for (entries) |e| {
-            expected_size += @sizeOf(wal_mod.EntryHeader) + e.payload.len;
-        }
-        result.wal_truncated = wal_size > expected_size;
-
-        if (result.wal_truncated) {
-            log.warn("WAL truncated: {d} valid entries, {d} bytes trailing garbage", .{
-                result.wal_entries, wal_size - expected_size,
-            });
-        } else {
-            log.info("WAL OK: {d} entries, {d} bytes", .{ result.wal_entries, wal_size });
-        }
+    if (entries.len > 0) {
+        log.info("WAL OK: {d} entries", .{result.wal_entries});
     } else {
         log.info("WAL empty", .{});
     }
@@ -177,14 +159,14 @@ test "startup_check: validate empty data dir" {
     try std.testing.expectEqual(@as(u64, 0), result.segment_count);
 }
 
-test "startup_check: validate with WAL" {
+test "startup_check: validate with segmented WAL" {
     const dir = "/tmp/billing_startup_wal_test";
     disk_io.make_path(dir) catch {};
     defer disk_io.remove_tree(dir);
 
-    // Write a small WAL.
+    // Write a small WAL using segmented format.
     {
-        var wal = try wal_mod.wal_open(dir ++ "/wal.log");
+        var wal = try wal_mod.wal_open_segmented(dir ++ "/wal", wal_mod.DEFAULT_SEGMENT_SIZE);
         defer wal.deinit();
         try wal.append(.commit, "test_payload");
         try wal.sync();
@@ -195,5 +177,4 @@ test "startup_check: validate with WAL" {
 
     const result = try validate(gpa.allocator(), dir);
     try std.testing.expectEqual(@as(usize, 1), result.wal_entries);
-    try std.testing.expect(!result.wal_truncated);
 }

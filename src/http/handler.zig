@@ -119,7 +119,7 @@ fn respond_events(conn: *HttpConn, log: *UsageLog, body: []const u8) void {
     // Update metrics.
     if (result.n_stored > 0) {
         metrics.wal_writes.inc();
-        metrics.wal_offset_bytes.set(@intCast(log.wal.write_offset));
+        metrics.wal_offset_bytes.set(@intCast(log.wal.global_offset));
         if (sync_mode) {
             metrics.wal_syncs.inc();
             metrics.wal_sync_duration.observe(dur);

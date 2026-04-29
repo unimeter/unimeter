@@ -32,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
     const env_metrics_port = init.environ_map.get("METRICS_PORT");
     const env_my_addr      = init.environ_map.get("MY_ADDR");
     const env_retention    = init.environ_map.get("RETENTION_DAYS");
+    const env_wal_seg_mb   = init.environ_map.get("WAL_SEGMENT_SIZE_MB");
 
     var bind_addr: ?[]const u8 = null;
 
@@ -87,6 +88,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (env_retention) |d| {
         cfg.retention_days = std.fmt.parseInt(u32, d, 10) catch 90;
+    }
+    if (env_wal_seg_mb) |m| {
+        const mb = std.fmt.parseInt(u32, m, 10) catch 256;
+        cfg.wal_segment_size = @as(u64, mb) * 1024 * 1024;
     }
 
     std.log.info("starting node {d} on port {d}, http_port={d}, data_dir={s}, peers={d}",

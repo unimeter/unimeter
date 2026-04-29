@@ -91,6 +91,22 @@ pub const RealFile = struct {
     }
 };
 
+/// Pre-allocate file space without writing. Prevents metadata updates on
+/// subsequent appends, keeping fdatasync fast. No-op if len is 0.
+pub fn fallocate(file: RealFile, len: u64) !void {
+    if (len == 0) return;
+    const rc = linux.fallocate(file.inner, 0, 0, @intCast(len));
+    try checkRc(rc);
+}
+
+/// Sync the directory entry (ensures newly created files survive crash).
+pub fn fsync_dir(path: []const u8) !void {
+    const fd = try open_dir(path);
+    defer close_dir(fd);
+    const rc = linux.fsync(fd);
+    try checkRc(rc);
+}
+
 /// Open or create a file at path with read+write permissions, preserving contents.
 /// Equivalent to `fs.cwd().createFile(path, .{ .truncate = false, .read = true })`.
 pub fn open_rw(path: []const u8) !RealFile {

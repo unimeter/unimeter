@@ -288,6 +288,7 @@ pub const ServerConfig = struct {
     data_dir:       []const u8            = "data",
     node_id:        NodeId                = 0,
     retention_days: u32                   = 90,
+    wal_segment_size: u64                 = @import("wal.zig").DEFAULT_SEGMENT_SIZE,
     peers:          []const PeerEntry     = &.{},
     /// On-wire "host:port" addresses indexed by NodeId.
     /// Populated from MY_ADDR env var for self, and derived from peer configs.
@@ -440,7 +441,10 @@ pub fn run(alloc: std.mem.Allocator, cfg: ServerConfig) !void {
         std.log.warn("startup: {d} segment files have inconsistent sizes", .{check.segments_bad});
     }
 
-    var log = try UsageLog.init(alloc, .{ .data_dir = cfg.data_dir });
+    var log = try UsageLog.init(alloc, .{
+        .data_dir = cfg.data_dir,
+        .wal_segment_size = cfg.wal_segment_size,
+    });
     defer log.deinit();
 
     // Initialize AggStore in-memory state.
@@ -1063,9 +1067,9 @@ fn handle_ingest(io: *RealIO, log: *UsageLog, conn: *Conn) !void {
     g_inflight_count += 1;
     try io.queue_write(
         encode(.write, conn.fd),
-        log.wal.file.fd(),
+        log.wal.fd(),
         conn.wal_buf[0..conn.batch.wal_entry_len],
-        log.wal.write_offset,
+        log.wal.write_offset(),
     );
 }
 
@@ -1080,14 +1084,16 @@ fn handle_write(io: *RealIO, log: *UsageLog, fd: i32, res: i32) !void {
 
     switch (conn.state) {
         .writing_wal => {
-            log.wal.advance(conn.batch.wal_entry_len, conn.batch.wal_new_crc);
+            log.wal.advance(conn.batch.wal_entry_len, conn.batch.wal_new_crc) catch |e| {
+                std.log.err("WAL segment rotation failed: {}", .{e});
+            };
             metrics.wal_writes.inc();
-            metrics.wal_offset_bytes.set(@intCast(log.wal.write_offset));
+            metrics.wal_offset_bytes.set(@intCast(log.wal.global_offset));
 
             if (conn.sync_mode) {
                 conn.state          = .fsyncing_wal;
                 conn.fsync_start_ns = @truncate(time_util.wallNanos());
-                try io.queue_fsync(encode(.fsync, fd), log.wal.file.fd());
+                try io.queue_fsync(encode(.fsync, fd), log.wal.fd());
             } else {
                 try queue_seg_write(io, log, conn);
             }
@@ -1095,15 +1101,8 @@ fn handle_write(io: *RealIO, log: *UsageLog, fd: i32, res: i32) !void {
 
         .writing_seg => {
             log.segment.advance(conn.batch.n_events);
-
-            if (conn.sync_mode) {
-                conn.state          = .fsyncing_seg;
-                conn.fsync_start_ns = @truncate(time_util.wallNanos());
-                try io.queue_fsync(encode(.fsync, fd), log.segment.file.fd());
-            } else {
-                finish_ingest_batch(conn);
-                try queue_send_resp(io, conn);
-            }
+            finish_ingest_batch(conn);
+            try queue_send_resp(io, conn);
         },
 
         else => {},
@@ -1116,17 +1115,20 @@ fn handle_fsync(io: *RealIO, log: *UsageLog, fd: i32) !void {
     const conn = conn_get(fd) orelse return;
 
     switch (conn.state) {
-        .fsyncing_wal => try queue_seg_write(io, log, conn),
-        .fsyncing_seg => {
+        .fsyncing_wal => {
             const now: i64 = @truncate(time_util.wallNanos());
             const fsync_dur: u64 = @intCast(@max(0, now - conn.fsync_start_ns));
             metrics.wal_syncs.inc();
             metrics.wal_sync_duration.observe(fsync_dur);
 
-            finish_ingest_batch(conn);
+            // WAL is durable — write segment (no fsync), then respond.
             send_prepare_to_replicas(conn) catch |e| {
                 std.log.warn("send_prepare failed: {}", .{e});
             };
+            try queue_seg_write(io, log, conn);
+        },
+        .fsyncing_seg => {
+            finish_ingest_batch(conn);
             try queue_send_resp(io, conn);
         },
         else => {},

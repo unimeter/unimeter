@@ -13,6 +13,7 @@ const time_util = @import("../util/time.zig");
 const wal_mod        = @import("wal.zig");
 const segment_mod    = @import("segment.zig");
 const Wal            = wal_mod.Wal;
+const SegmentedWal   = wal_mod.SegmentedWal;
 const Segment        = segment_mod.Segment;
 const DEFAULT_MAX_EVENTS = segment_mod.DEFAULT_MAX_EVENTS;
 const DedupRing      = @import("dedup.zig").DedupRing;
@@ -44,11 +45,12 @@ pub const Config = struct {
     data_dir:    []const u8,
     max_events_per_segment: u32 = DEFAULT_MAX_EVENTS,
     dedup_window_ms: i64 = 5 * 60 * 1000,
+    wal_segment_size: u64 = wal_mod.DEFAULT_SEGMENT_SIZE,
 };
 
 pub const UsageLog = struct {
     alloc:    std.mem.Allocator,
-    wal:      Wal,
+    wal:      SegmentedWal,
     segment:  Segment,
     dedup:    DedupRing,
     registry: MetricRegistry,
@@ -60,10 +62,10 @@ pub const UsageLog = struct {
         const disk_io = @import("../io/disk_io.zig");
         try disk_io.make_path(cfg.data_dir);
 
-        // WAL lives directly in the data dir.
-        var wal_path_buf: [512]u8 = undefined;
-        const wal_path = try std.fmt.bufPrint(&wal_path_buf, "{s}/wal.log", .{cfg.data_dir});
-        const wal = try wal_mod.wal_open(wal_path);
+        // WAL directory inside data dir.
+        var wal_dir_buf: [512]u8 = undefined;
+        const wal_dir = try std.fmt.bufPrint(&wal_dir_buf, "{s}/wal", .{cfg.data_dir});
+        const wal = try wal_mod.wal_open_segmented(wal_dir, cfg.wal_segment_size);
         errdefer @constCast(&wal).deinit();
 
         // Segment starts at offset 0.
