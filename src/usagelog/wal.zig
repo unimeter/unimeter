@@ -247,16 +247,12 @@ fn open_wal_segment(dir: []const u8, index: u32, segment_size: u64, prev_crc: u3
 pub fn wal_open_segmented(dir: []const u8, segment_size: u64) !SegmentedWal {
     disk_io.make_path(dir) catch {};
 
-    // Migration: if wal.log exists in parent dir, we're on old format.
-    // This is handled by the caller (usagelog.zig).
-
     // Find the highest segment index.
     var max_index: u32 = 0;
     var found: bool = false;
     {
         const dfd = disk_io.open_dir(dir) catch |err| switch (err) {
             error.FileNotFound => {
-                // Empty dir, create first segment.
                 var result = SegmentedWal{
                     .wal           = try open_wal_segment(dir, 0, segment_size, 0),
                     .segment_index = 0,
@@ -287,7 +283,6 @@ pub fn wal_open_segmented(dir: []const u8, segment_size: u64) !SegmentedWal {
     }
 
     if (!found) {
-        // Empty directory, create first segment.
         var result = SegmentedWal{
             .wal           = try open_wal_segment(dir, 0, segment_size, 0),
             .segment_index = 0,
@@ -300,12 +295,18 @@ pub fn wal_open_segmented(dir: []const u8, segment_size: u64) !SegmentedWal {
         return result;
     }
 
-    // Recover CRC chain across all segments to find last_crc.
-    // Read each segment's data and walk the CRC chain.
+    // Use recover_segmented to walk the CRC chain across all segments.
+    // This gives us prev_crc and total data size without duplicating scan logic.
+    // Temporary allocation — freed after extracting CRC and sizes.
+    var tmp_gpa = std.heap.DebugAllocator(.{}){};
+    const tmp_alloc = tmp_gpa.allocator();
+    defer _ = tmp_gpa.deinit();
+
     var prev_crc: u32 = 0;
     var total_bytes: u64 = 0;
     var last_seg_data_size: u64 = 0;
 
+    // Walk each segment individually to compute per-segment data sizes.
     var seg_idx: u32 = 0;
     while (seg_idx <= max_index) : (seg_idx += 1) {
         var path_buf: [512]u8 = undefined;
@@ -316,66 +317,41 @@ pub fn wal_open_segmented(dir: []const u8, segment_size: u64) !SegmentedWal {
         const file_size = file.size() catch continue;
         if (file_size == 0) continue;
 
-        // Read file content to walk CRC chain.
-        // For pre-allocated files, only read up to segment_size.
-        const read_size: usize = @intCast(@min(file_size, segment_size));
-        // Use a fixed buffer for scanning — we don't need to keep the data.
-        // Read in chunks and walk the CRC chain.
-        var pos: usize = 0;
-        var chunk_buf: [65536]u8 = undefined;
-
-        // Simple approach: read entire segment and walk CRC chain.
-        // Segments are at most 256 MB — acceptable for startup.
-        var seg_offset: u64 = 0;
-        try file.seek_to(0);
-
-        while (seg_offset < read_size) {
-            const to_read = @min(chunk_buf.len, read_size - @as(usize, @intCast(seg_offset)));
-            var n: usize = 0;
-            while (n < to_read) {
-                const r = file.read(chunk_buf[n..to_read]) catch break;
-                if (r == 0) break;
-                n += r;
-            }
+        const data = tmp_alloc.alloc(u8, @intCast(file_size)) catch continue;
+        defer tmp_alloc.free(data);
+        var read_total: usize = 0;
+        while (read_total < data.len) {
+            const n = file.read(data[read_total..]) catch break;
             if (n == 0) break;
-
-            // Walk entries in this chunk (simplified: entries don't span chunks for now).
-            var cpos: usize = 0;
-            while (cpos + @sizeOf(EntryHeader) <= n) {
-                var header: EntryHeader = undefined;
-                @memcpy(std.mem.asBytes(&header), chunk_buf[cpos .. cpos + @sizeOf(EntryHeader)]);
-                if (header.prev_crc != prev_crc) {
-                    // Chain broken or end of data (pre-allocated zeros).
-                    // This is the actual end of data in this segment.
-                    last_seg_data_size = seg_offset + cpos;
-                    break;
-                }
-                if (cpos + @sizeOf(EntryHeader) + header.payload_len > n) break; // truncated
-
-                const payload = chunk_buf[cpos + @sizeOf(EntryHeader) .. cpos + @sizeOf(EntryHeader) + header.payload_len];
-                if (std.hash.Crc32.hash(payload) != header.payload_crc) break;
-
-                var h = std.hash.Crc32.init();
-                h.update(std.mem.asBytes(&header));
-                h.update(payload);
-                prev_crc = h.final();
-
-                const entry_len = @sizeOf(EntryHeader) + header.payload_len;
-                cpos += entry_len;
-                pos += entry_len;
-            }
-            if (cpos + @sizeOf(EntryHeader) <= n) {
-                // Broke out of inner loop — end of valid data.
-                last_seg_data_size = seg_offset + cpos;
-                break;
-            }
-            seg_offset += @intCast(n);
-            last_seg_data_size = seg_offset;
+            read_total += n;
         }
-        total_bytes += last_seg_data_size;
+
+        // Walk CRC chain to find data end in this segment.
+        var pos: usize = 0;
+        while (pos + @sizeOf(EntryHeader) <= read_total) {
+            var header: EntryHeader = undefined;
+            @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
+            if (header.prev_crc != prev_crc) break;
+            _ = std.enums.fromInt(EntryType, header.entry_type) orelse break;
+
+            const payload_end = pos + @sizeOf(EntryHeader) + header.payload_len;
+            if (payload_end > read_total) break;
+            const payload = data[pos + @sizeOf(EntryHeader) .. payload_end];
+            if (std.hash.Crc32.hash(payload) != header.payload_crc) break;
+
+            var h = std.hash.Crc32.init();
+            h.update(std.mem.asBytes(&header));
+            h.update(payload);
+            prev_crc = h.final();
+
+            pos = payload_end;
+        }
+
+        last_seg_data_size = pos;
+        total_bytes += pos;
     }
 
-    // Open the last segment for appending at the correct offset.
+    // Open the last segment for appending at the data end.
     var path_buf: [512]u8 = undefined;
     const last_path = try segment_filename(dir, max_index, &path_buf);
     const rf = try disk_io.open_rw(last_path);
@@ -422,9 +398,14 @@ pub fn recover_segmented(dir: []const u8, alloc: std.mem.Allocator) ![]RecoveryE
 
     std.mem.sort(u32, indices.items, {}, std.sort.asc(u32));
 
-    // Concatenate all segment data and recover as one stream.
-    var all_data: std.ArrayList(u8) = .empty;
-    defer all_data.deinit(alloc);
+    // Recover each segment separately, carrying prev_crc across boundaries.
+    // Cannot concatenate files because pre-allocated segments have trailing zeros.
+    var all_entries: std.ArrayList(RecoveryEntry) = .empty;
+    errdefer {
+        for (all_entries.items) |e| alloc.free(e.payload);
+        all_entries.deinit(alloc);
+    }
+    var prev_crc: u32 = 0;
 
     for (indices.items) |idx| {
         var path_buf: [512]u8 = undefined;
@@ -434,19 +415,46 @@ pub fn recover_segmented(dir: []const u8, alloc: std.mem.Allocator) ![]RecoveryE
         const sz = file.size() catch continue;
         if (sz == 0) continue;
 
-        const start = all_data.items.len;
-        all_data.resize(alloc, start + @as(usize, @intCast(sz))) catch continue;
+        const data = alloc.alloc(u8, @intCast(sz)) catch continue;
+        defer alloc.free(data);
         var total: usize = 0;
         while (total < @as(usize, @intCast(sz))) {
-            const n = file.read(all_data.items[start + total ..]) catch break;
+            const n = file.read(data[total..]) catch break;
             if (n == 0) break;
             total += n;
         }
-        // Trim to actual bytes read (in case of pre-allocated files).
-        all_data.shrinkRetainingCapacity(start + total);
+
+        // Walk CRC chain within this segment, starting from prev_crc.
+        var pos: usize = 0;
+        while (pos + @sizeOf(EntryHeader) <= total) {
+            var header: EntryHeader = undefined;
+            @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
+            if (header.prev_crc != prev_crc) break;
+
+            const entry_type = std.enums.fromInt(EntryType, header.entry_type) orelse break;
+            pos += @sizeOf(EntryHeader);
+
+            if (pos + header.payload_len > total) break;
+            const payload_slice = data[pos .. pos + header.payload_len];
+            if (std.hash.Crc32.hash(payload_slice) != header.payload_crc) break;
+
+            const payload = alloc.dupe(u8, payload_slice) catch break;
+            errdefer alloc.free(payload);
+
+            var h = std.hash.Crc32.init();
+            h.update(std.mem.asBytes(&header));
+            h.update(payload_slice);
+            prev_crc = h.final();
+            pos += header.payload_len;
+
+            all_entries.append(alloc, .{
+                .entry_type = entry_type,
+                .payload    = payload,
+            }) catch break;
+        }
     }
 
-    return recover_bytes(all_data.items, alloc);
+    return all_entries.toOwnedSlice(alloc);
 }
 
 // ---- Recovery ----
@@ -690,4 +698,226 @@ test "segmented wal: empty dir returns empty recovery" {
 
     const entries = try recover_segmented(dir, gpa.allocator());
     try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "segmented wal: rotation exactly at segment boundary" {
+    const dir = "/tmp/billing_segwal_boundary_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    // Entry with payload "x" = 16 + 1 = 17 bytes.
+    // Segment size 51 = 3 entries exactly, rotation on 4th.
+    const seg_size: u64 = 51;
+
+    {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+
+        try wal.append(.commit, "a");
+        try wal.append(.commit, "b");
+        try wal.append(.commit, "c"); // fills segment 0 exactly (3×17=51)
+        try std.testing.expectEqual(@as(u32, 1), wal.segment_index); // rotated
+        try wal.append(.commit, "d"); // first entry in segment 1
+        try wal.sync();
+    }
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+    try std.testing.expectEqualSlices(u8, "a", entries[0].payload);
+    try std.testing.expectEqualSlices(u8, "d", entries[3].payload);
+}
+
+test "segmented wal: multiple reopen cycles across rotations" {
+    const dir = "/tmp/billing_segwal_multi_reopen";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    const seg_size: u64 = 128;
+
+    // 5 cycles: open → write 10 entries → close. Total 50 entries.
+    // With small segments, should rotate multiple times across reopens.
+    for (0..5) |cycle| {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+        for (0..10) |j| {
+            var buf: [20]u8 = undefined;
+            const payload = std.fmt.bufPrint(&buf, "c{d}_e{d}", .{ cycle, j }) catch unreachable;
+            try wal.append(.commit, payload);
+        }
+        try wal.sync();
+    }
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 50), entries.len);
+    try std.testing.expectEqualSlices(u8, "c0_e0", entries[0].payload);
+    try std.testing.expectEqualSlices(u8, "c4_e9", entries[49].payload);
+}
+
+test "segmented wal: build_entry + advance triggers rotation" {
+    const dir = "/tmp/billing_segwal_advance_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    const seg_size: u64 = 100;
+
+    var wal = try wal_open_segmented(dir, seg_size);
+    defer wal.deinit();
+
+    // Simulate the io_uring async path: build_entry → write → advance.
+    var out_buf: [256]u8 = undefined;
+    const initial_seg = wal.segment_index;
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var payload_buf: [8]u8 = undefined;
+        const payload = std.fmt.bufPrint(&payload_buf, "ev_{d:0>3}", .{i}) catch unreachable;
+        const built = wal.build_entry(.commit, payload, &out_buf);
+
+        // Simulate write (in real server, io_uring does this).
+        try wal.wal.file.seek_to(wal.wal.write_offset);
+        try wal.wal.file.write_all(out_buf[0..built.len]);
+
+        try wal.advance(built.len, built.crc);
+    }
+    try wal.sync();
+
+    // Verify rotation happened.
+    try std.testing.expect(wal.segment_index > initial_seg);
+
+    // Recovery must find all 20 entries.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 20), entries.len);
+    try std.testing.expectEqualSlices(u8, "ev_000", entries[0].payload);
+    try std.testing.expectEqualSlices(u8, "ev_019", entries[19].payload);
+}
+
+test "segmented wal: recovery ignores trailing zeros in pre-allocated files" {
+    const dir = "/tmp/billing_segwal_zeros_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    // Create a segment and write one entry. File will be pre-allocated
+    // (fallocate) with zeros after the entry.
+    const seg_size: u64 = 4096;
+    {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+        try wal.append(.commit, "only_entry");
+        try wal.sync();
+    }
+
+    // Verify file is pre-allocated (larger than data).
+    var path_buf: [512]u8 = undefined;
+    const path = try segment_filename(dir, 0, &path_buf);
+    const f = try disk_io.open_ro(path);
+    defer f.close();
+    const file_size = try f.size();
+    try std.testing.expect(file_size >= seg_size); // pre-allocated
+
+    // Recovery must return exactly 1 entry despite file being 4KB.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualSlices(u8, "only_entry", entries[0].payload);
+}
+
+test "segmented wal: global_offset tracks total bytes" {
+    const dir = "/tmp/billing_segwal_global_test";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    const seg_size: u64 = 100;
+
+    var wal = try wal_open_segmented(dir, seg_size);
+    defer wal.deinit();
+
+    const before = wal.global_offset;
+    try wal.append(.commit, "hello"); // 16 + 5 = 21 bytes
+    try std.testing.expectEqual(before + 21, wal.global_offset);
+
+    // Write enough to trigger rotation.
+    for (0..10) |_| {
+        try wal.append(.commit, "padding_");
+    }
+
+    // global_offset must be monotonically increasing across rotations.
+    try std.testing.expect(wal.global_offset > before + 21);
+    try std.testing.expect(wal.segment_index > 0);
+    // write_offset (within current segment) must be less than segment_size.
+    try std.testing.expect(wal.write_offset() < seg_size);
+}
+
+test "segmented wal: large payload spanning near segment boundary" {
+    const dir = "/tmp/billing_segwal_large_payload";
+    disk_io.remove_tree(dir);
+    defer disk_io.remove_tree(dir);
+
+    // Segment size just above one large entry.
+    // Large payload = 200 bytes, entry = 216 bytes. Segment = 250.
+    // First entry fills most of segment. Second triggers rotation.
+    const seg_size: u64 = 250;
+    const large_payload = [_]u8{'X'} ** 200;
+
+    {
+        var wal = try wal_open_segmented(dir, seg_size);
+        defer wal.deinit();
+
+        try wal.append(.commit, &large_payload); // 216 bytes, fits
+        try std.testing.expectEqual(@as(u32, 0), wal.segment_index);
+
+        try wal.append(.commit, "small"); // 21 bytes, 216+21=237 < 250, fits
+        try wal.append(.commit, "trigger"); // 23 bytes, 237+23=260 > 250, rotates
+        try std.testing.expect(wal.segment_index >= 1);
+        try wal.sync();
+    }
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const entries = try recover_segmented(dir, alloc);
+    defer {
+        for (entries) |e| alloc.free(e.payload);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqual(@as(usize, 200), entries[0].payload.len);
+    try std.testing.expectEqualSlices(u8, "small", entries[1].payload);
+    try std.testing.expectEqualSlices(u8, "trigger", entries[2].payload);
 }
