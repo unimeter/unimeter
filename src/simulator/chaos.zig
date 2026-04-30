@@ -183,12 +183,13 @@ pub fn heal_network(c: *VirtualCluster) void {
 /// Only affects alive nodes that have non-empty WALs.
 pub fn corrupt_disk_write(c: *VirtualCluster, rng: Rng) void {
     const p = rng.uintLessThan(u32, cluster.SIM_PARTITIONS);
-    const wal_data = c.wals[p].file.bytes();
+    const current = c.wals[p].current_file();
+    const wal_data = current.bytes();
     if (wal_data.len == 0) return;
 
     const pos:  usize = rng.uintLessThan(usize, wal_data.len);
     const mask: u8    = rng.int(u8);
-    c.wals[p].file.corrupt(pos, mask);
+    current.corrupt(pos, mask);
     c.wal_corrupted = true;
 }
 
@@ -345,10 +346,10 @@ test "chaos: corrupt_disk_write flips a byte" {
     var c = try VirtualCluster.init(alloc, 1);
     defer c.deinit();
 
-    // Write bytes directly to shared partition 0 WAL so there is data to corrupt.
-    try c.wals[0].file.write_all("DEADBEEFCAFE0000");
+    // Write an entry to partition 0 WAL so there is data to corrupt.
+    try c.wals[0].append(.commit, "DEADBEEFCAFE0000");
 
-    const before_len = c.wals[0].file.bytes().len;
+    const before_len = c.wals[0].current_file().bytes().len;
     try std.testing.expect(before_len > 0);
 
     var prng = std.Random.DefaultPrng.init(0);
@@ -356,7 +357,7 @@ test "chaos: corrupt_disk_write flips a byte" {
     corrupt_disk_write(&c, rng);
 
     // Length is unchanged; only content may differ.
-    try std.testing.expectEqual(before_len, c.wals[0].file.bytes().len);
+    try std.testing.expectEqual(before_len, c.wals[0].current_file().bytes().len);
 }
 
 test "chaos: pick_action covers all tags" {

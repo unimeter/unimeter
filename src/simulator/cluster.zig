@@ -1,6 +1,6 @@
 //! VirtualCluster: deterministic 3-node cluster for VOPR.
 //! Simulates a virtual message bus, tick-based time, and node crash/restart.
-//! All storage is in-memory via FakeWal. No real I/O occurs.
+//! Storage uses FakeSegmentedWal — same code path as production, in-memory backend.
 //!
 //! Partition assignment: partition_id % SIM_NODES → leader node.
 //!   Partitions 0,3,6 → node0 leads; 1,4,7 → node1; 2,5,8 → node2.
@@ -84,8 +84,10 @@ pub const VirtualCluster = struct {
     now_ns:            i64,
     /// Per-partition list of successfully committed events, in commit order.
     committed_events:  [SIM_PARTITIONS]std.ArrayList(Event),
-    /// Shared WAL per partition — all leaders write to the same WAL.
-    wals:              [SIM_PARTITIONS]fake_io.FakeWal,
+    /// Shared SegmentedWal per partition — same code path as production.
+    /// Heap-allocated to avoid self-referential pointer invalidation on struct copy.
+    wal_storages:      *[SIM_PARTITIONS]fake_io.FakeStorage,
+    wals:              [SIM_PARTITIONS]fake_io.FakeSegmentedWal,
     /// Set to true when corrupt_disk_write chaos action fires. Disables I_WAL check.
     wal_corrupted:     bool,
     // Chaos state (all zero/false = no chaos).
@@ -101,14 +103,24 @@ pub const VirtualCluster = struct {
         }
         var committed_events: [SIM_PARTITIONS]std.ArrayList(Event) = undefined;
         for (0..SIM_PARTITIONS) |p| committed_events[p] = .empty;
-        var wals: [SIM_PARTITIONS]fake_io.FakeWal = undefined;
-        for (0..SIM_PARTITIONS) |p| wals[p] = try fake_io.fake_wal_create(alloc);
+        const wal_storages = try alloc.create([SIM_PARTITIONS]fake_io.FakeStorage);
+        for (0..SIM_PARTITIONS) |p| wal_storages[p] = fake_io.FakeStorage.init(alloc);
+
+        // Tiny segment size (512B) exercises rotation frequently in VOPR.
+        const seg_size: u64 = 512;
+        var wals: [SIM_PARTITIONS]fake_io.FakeSegmentedWal = undefined;
+        for (0..SIM_PARTITIONS) |p| {
+            var dir_buf: [32]u8 = undefined;
+            const d = std.fmt.bufPrint(&dir_buf, "wal_p{d}", .{p}) catch "wal";
+            wals[p] = try fake_io.FakeSegmentedWal.open(&wal_storages[p], d, seg_size, alloc);
+        }
         return .{
             .alloc             = alloc,
             .nodes             = nodes,
             .inbox             = .empty,
             .now_ns            = 0,
             .committed_events  = committed_events,
+            .wal_storages      = wal_storages,
             .wals              = wals,
             .wal_corrupted     = false,
             .chaos_rng         = std.Random.DefaultPrng.init(seed),
@@ -123,6 +135,8 @@ pub const VirtualCluster = struct {
         self.inbox.deinit(self.alloc);
         for (&self.committed_events) |*list| list.deinit(self.alloc);
         for (&self.wals) |*w| w.deinit();
+        for (self.wal_storages) |*s| s.deinit();
+        self.alloc.destroy(self.wal_storages);
     }
 
     // ---- Time ----
@@ -207,7 +221,7 @@ pub const VirtualCluster = struct {
             .prepare => |msg| {
                 if (node.vsr[p].role != .replica) return;
                 // Use shared WAL CRC as the wal_crc proof.
-                const wal_crc = self.wals[p].last_crc;
+                const wal_crc = self.wals[p].last_crc_val();
                 const ok = node.vsr[p].on_prepare(&msg, wal_crc) orelse return;
                 node.vsr[p].last_ping_ns = self.now_ns;
                 const leader_id = node.vsr[p].leader_node(msg.header.view_number);

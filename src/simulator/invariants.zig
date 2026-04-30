@@ -715,22 +715,23 @@ fn check_wal_recovery(c: *const VirtualCluster, alloc: std.mem.Allocator) Invari
         const committed = c.committed_events[p].items;
         if (committed.len == 0) continue;
 
-        // Recover events from the shared WAL for this partition.
-        const wal_bytes = c.wals[p].file.bytes();
-        if (wal_bytes.len == 0) {
-            if (committed.len > 0) return error.WalEventsMissing;
-            continue;
-        }
+        // Recover events from the shared SegmentedWal for this partition.
+        // Uses the same recover() code path as production startup.
+        var dir_buf: [32]u8 = undefined;
+        const wal_dir = std.fmt.bufPrint(&dir_buf, "wal_p{d}", .{p}) catch continue;
+        const storage = &@constCast(c).wal_storages.*[p];
 
-        var all_wal_events: std.ArrayList(Event) = .empty;
-        defer all_wal_events.deinit(alloc);
-
-        const entries = wal_mod.recover_bytes(wal_bytes, alloc) catch
+        const entries = fake_io.FakeSegmentedWal.recover(storage, wal_dir, alloc) catch
             return error.WalEventsCorrupted;
         defer {
             for (entries) |e| alloc.free(e.payload);
             alloc.free(entries);
         }
+
+        if (entries.len == 0 and committed.len > 0) return error.WalEventsMissing;
+
+        var all_wal_events: std.ArrayList(Event) = .empty;
+        defer all_wal_events.deinit(alloc);
 
         for (entries) |entry| {
             if (entry.entry_type != .commit) continue;

@@ -15,8 +15,9 @@ pub const decode_fd  = @import("real_io.zig").decode_fd;
 // ---- In-memory file ----
 
 const FakeFileData = struct {
-    buf:    std.ArrayList(u8),
-    cursor: usize,
+    buf:       std.ArrayList(u8),
+    cursor:    usize,
+    ownership: enum { self_owned, storage_managed, read_only_copy } = .self_owned,
 };
 
 /// In-memory substitute for a real file.
@@ -81,8 +82,17 @@ pub const FakeFile = struct {
     }
 
     pub fn close(self: FakeFile) void {
-        self.data.buf.deinit(self.alloc);
-        self.alloc.destroy(self.data);
+        switch (self.data.ownership) {
+            .self_owned => {
+                self.data.buf.deinit(self.alloc);
+                self.alloc.destroy(self.data);
+            },
+            .storage_managed => {}, // FakeStorage owns the data
+            .read_only_copy => {
+                // Free the FakeFileData struct but not the buf (shared with source).
+                self.alloc.destroy(self.data);
+            },
+        }
     }
 
     /// Read-only view of the underlying buffer. Used by invariant checker.
@@ -98,10 +108,105 @@ pub const FakeFile = struct {
     }
 };
 
+// ---- In-memory storage for VOPR ----
+
+/// FakeStorage: in-memory directory of named files.
+/// Drop-in replacement for RealStorage in SegmentedWal.
+pub const FakeStorage = struct {
+    alloc: std.mem.Allocator,
+    files: std.StringHashMap(*FakeFileData),
+
+    pub const FileT = FakeFile;
+
+    pub fn init(alloc: std.mem.Allocator) FakeStorage {
+        return .{
+            .alloc = alloc,
+            .files = std.StringHashMap(*FakeFileData).init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *FakeStorage) void {
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.buf.deinit(self.alloc);
+            self.alloc.destroy(entry.value_ptr.*);
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.files.deinit();
+    }
+
+    pub fn make_path(self: *FakeStorage, path: []const u8) !void {
+        _ = self;
+        _ = path;
+    }
+
+    pub fn open_rw(self: *FakeStorage, path: []const u8) !FakeFile {
+        if (self.files.get(path)) |data| {
+            return FakeFile{ .data = data, .alloc = self.alloc };
+        }
+        const d = try self.alloc.create(FakeFileData);
+        d.* = .{ .buf = .empty, .cursor = 0, .ownership = .storage_managed };
+        const key = try self.alloc.dupe(u8, path);
+        try self.files.put(key, d);
+        return FakeFile{ .data = d, .alloc = self.alloc };
+    }
+
+    pub fn open_ro(self: *FakeStorage, path: []const u8) !FakeFile {
+        const data = self.files.get(path) orelse return error.FileNotFound;
+        // Create a separate FakeFileData for reading so cursor doesn't
+        // conflict with ongoing writes to the same file.
+        const rd = try self.alloc.create(FakeFileData);
+        rd.* = .{ .buf = data.buf, .cursor = 0, .ownership = .read_only_copy };
+        // Share the same buffer but independent cursor.
+        // Note: rd.buf is a copy of the ArrayList struct (pointer + len + capacity),
+        // pointing to the same backing memory. Reads see the same data.
+        return FakeFile{ .data = rd, .alloc = self.alloc };
+    }
+
+    pub fn fallocate(_: *FakeStorage, file: FakeFile, len: u64) !void {
+        const d = file.data;
+        const target: usize = @intCast(len);
+        while (d.buf.items.len < target) {
+            try d.buf.append(file.alloc, 0);
+        }
+    }
+
+    pub fn fsync_dir(_: *FakeStorage, _: []const u8) !void {}
+
+    /// List segment indices (files matching seg_NNNNNN.log pattern) in a directory.
+    pub fn list_segment_indices(self: *FakeStorage, dir: []const u8, out: *std.ArrayList(u32), alloc: std.mem.Allocator) !void {
+        _ = alloc;
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            const path = entry.key_ptr.*;
+            // Check path starts with dir + "/"
+            if (!std.mem.startsWith(u8, path, dir)) continue;
+            if (path.len <= dir.len + 1) continue;
+            if (path[dir.len] != '/') continue;
+            const name = path[dir.len + 1 ..];
+            if (name.len == 14 and std.mem.startsWith(u8, name, "seg_") and
+                std.mem.endsWith(u8, name, ".log"))
+            {
+                const idx = std.fmt.parseInt(u32, name[4..10], 10) catch continue;
+                try out.append(self.alloc, idx);
+            }
+        }
+    }
+
+    /// Read-only: get raw bytes of a file. For invariant checks.
+    pub fn file_bytes(self: *FakeStorage, path: []const u8) []const u8 {
+        const data = self.files.get(path) orelse return &[_]u8{};
+        return data.buf.items;
+    }
+};
+
 // ---- In-memory WAL and Segment ----
 
-/// In-memory WAL for VOPR.
+/// In-memory WAL (low-level, used for unit tests).
 pub const FakeWal = wal_mod.WalGeneric(FakeFile);
+
+/// In-memory SegmentedWal for VOPR (uses same code path as production).
+pub const FakeSegmentedWal = wal_mod.SegmentedWalGeneric(FakeStorage);
 
 /// In-memory Segment for VOPR.
 pub const FakeSegment = seg_mod.SegmentGeneric(FakeFile);

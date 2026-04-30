@@ -131,330 +131,326 @@ pub fn wal_open(path: []const u8) !Wal {
 
 pub const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024; // 256 MB
 
-/// Segmented WAL: splits writes across fixed-size files.
-/// Pre-allocates each segment with fallocate to keep fdatasync fast.
-/// Exposes the same interface as Wal (file, write_offset, advance, build_entry, sync).
-pub const SegmentedWal = struct {
-    wal:             Wal,            // current segment
-    segment_index:   u32,
-    segment_size:    u64,
-    global_offset:   u64,            // total bytes across all segments
-    dir_path:        [512]u8,
-    dir_path_len:    u16,
+/// Production SegmentedWal backed by real files.
+pub const SegmentedWal = SegmentedWalGeneric(RealStorage);
 
-    const Self = @This();
+/// RealStorage: wraps disk_io for production use.
+pub const RealStorage = struct {
+    pub const FileT = disk_io.RealFile;
 
-    /// File descriptor of the current segment (for io_uring).
-    pub fn fd(self: *const Self) i32 {
-        return self.wal.file.fd();
+    _dummy: u8 = 0,
+
+    pub fn make_path(_: *RealStorage, path: []const u8) !void {
+        try disk_io.make_path(path);
     }
 
-    /// Byte offset within the current segment file (for io_uring pwrite).
-    pub fn write_offset(self: *const Self) u64 {
-        return self.wal.write_offset;
+    pub fn open_rw(_: *RealStorage, path: []const u8) !FileT {
+        return disk_io.open_rw(path);
     }
 
-    pub fn last_crc(self: *const Self) u32 {
-        return self.wal.last_crc;
+    pub fn open_ro(_: *RealStorage, path: []const u8) !FileT {
+        return disk_io.open_ro(path);
     }
 
-    /// Build a WAL entry into out_buf. Same as Wal.build_entry.
-    pub fn build_entry(
-        self: *const Self,
-        entry_type: EntryType,
-        payload:    []const u8,
-        out_buf:    []u8,
-    ) BuildResult {
-        return self.wal.build_entry(entry_type, payload, out_buf);
+    pub fn fallocate(_: *RealStorage, file: FileT, len: u64) !void {
+        try disk_io.fallocate(file, len);
     }
 
-    /// Advance write position after a successful io_uring write CQE.
-    /// If the segment is full, rotates to a new one.
-    pub fn advance(self: *Self, entry_len: usize, new_crc: u32) !void {
-        self.wal.advance(entry_len, new_crc);
-        self.global_offset += entry_len;
-        if (self.wal.write_offset >= self.segment_size) {
-            try self.rotate();
+    pub fn fsync_dir(_: *RealStorage, path: []const u8) !void {
+        try disk_io.fsync_dir(path);
+    }
+
+    pub fn list_segment_indices(_: *RealStorage, dir: []const u8, out: *std.ArrayList(u32), alloc: std.mem.Allocator) !void {
+        const dfd = try disk_io.open_dir(dir);
+        defer disk_io.close_dir(dfd);
+        var it = disk_io.DirIter.init(dfd);
+        while (try it.next()) |name| {
+            if (name.len == 14 and std.mem.startsWith(u8, name, "seg_") and
+                std.mem.endsWith(u8, name, ".log"))
+            {
+                const idx = std.fmt.parseInt(u32, name[4..10], 10) catch continue;
+                try out.append(alloc, idx);
+            }
         }
     }
 
-    /// Append an entry (synchronous path, used in ingest/tests).
-    pub fn append(self: *Self, entry_type: EntryType, payload: []const u8) !void {
-        try self.wal.append(entry_type, payload);
-        const entry_len = @sizeOf(EntryHeader) + payload.len;
-        self.global_offset += entry_len;
-        if (self.wal.write_offset >= self.segment_size) {
-            try self.rotate();
-        }
-    }
-
-    pub fn sync(self: *Self) !void {
-        try self.wal.sync();
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.wal.deinit();
-    }
-
-    fn rotate(self: *Self) !void {
-        self.wal.sync() catch {};
-        self.wal.deinit();
-        self.segment_index += 1;
-        self.wal = try open_wal_segment(
-            self.dir_path[0..self.dir_path_len],
-            self.segment_index,
-            self.segment_size,
-            self.wal.last_crc,
-        );
-    }
-
-    fn dir(self: *const Self) []const u8 {
-        return self.dir_path[0..self.dir_path_len];
-    }
+    pub fn deinit(_: *RealStorage) void {}
 };
 
 fn segment_filename(dir: []const u8, index: u32, buf: []u8) ![]const u8 {
-    const n = std.fmt.bufPrint(buf, "{s}/seg_{d:0>6}.log", .{ dir, index }) catch
+    return std.fmt.bufPrint(buf, "{s}/seg_{d:0>6}.log", .{ dir, index }) catch
         return error.NameTooLong;
-    return n;
 }
 
-fn open_wal_segment(dir: []const u8, index: u32, segment_size: u64, prev_crc: u32) !Wal {
-    var path_buf: [512]u8 = undefined;
-    const path = try segment_filename(dir, index, &path_buf);
-    const rf = try disk_io.open_rw(path);
-    errdefer rf.close();
+/// Generic segmented WAL parameterised on storage backend.
+/// Production uses RealStorage (disk_io). VOPR uses FakeStorage (in-memory).
+pub fn SegmentedWalGeneric(comptime StorageT: type) type {
+    const InnerWal = WalGeneric(StorageT.FileT);
 
-    // Pre-allocate to avoid metadata updates on append.
-    disk_io.fallocate(rf, segment_size) catch {};
+    return struct {
+        wal:             InnerWal,
+        storage:         *StorageT,
+        segment_index:   u32,
+        segment_size:    u64,
+        global_offset:   u64,
+        dir_path:        [512]u8,
+        dir_path_len:    u16,
 
-    const sz = try rf.size();
-    // If file is pre-allocated but empty, write_offset = 0.
-    // If file has data (recovery), write_offset = actual data size.
-    // We use the minimum of file size and segment_size to handle pre-allocated files.
-    const data_size = if (sz > segment_size) segment_size else sz;
-    _ = data_size;
+        const Self = @This();
 
-    // New segment: write from offset 0 (file is pre-allocated with zeros).
-    try rf.seek_to(0);
-    var wal = Wal.init_with_file(rf, 0);
-    wal.last_crc = prev_crc;
-    return wal;
-}
+        // ---- Public interface (same for production and VOPR) ----
 
-/// Open a segmented WAL directory for appending. Creates the directory if needed.
-/// Scans existing segments to find the last one and recover CRC chain.
-pub fn wal_open_segmented(dir: []const u8, segment_size: u64) !SegmentedWal {
-    disk_io.make_path(dir) catch {};
+        /// File descriptor of the current segment (for io_uring). Only available on RealFile.
+        pub fn fd(self: *const Self) i32 {
+            return self.wal.file.fd();
+        }
 
-    // Find the highest segment index.
-    var max_index: u32 = 0;
-    var found: bool = false;
-    {
-        const dfd = disk_io.open_dir(dir) catch |err| switch (err) {
-            error.FileNotFound => {
-                var result = SegmentedWal{
-                    .wal           = try open_wal_segment(dir, 0, segment_size, 0),
+        pub fn write_offset(self: *const Self) u64 {
+            return self.wal.write_offset;
+        }
+
+        pub fn last_crc_val(self: *const Self) u32 {
+            return self.wal.last_crc;
+        }
+
+        pub fn build_entry(
+            self: *const Self,
+            entry_type: EntryType,
+            payload:    []const u8,
+            out_buf:    []u8,
+        ) BuildResult {
+            return self.wal.build_entry(entry_type, payload, out_buf);
+        }
+
+        pub fn advance(self: *Self, entry_len: usize, new_crc: u32) !void {
+            self.wal.advance(entry_len, new_crc);
+            self.global_offset += entry_len;
+            if (self.wal.write_offset >= self.segment_size) {
+                try self.rotate();
+            }
+        }
+
+        pub fn append(self: *Self, entry_type: EntryType, payload: []const u8) !void {
+            try self.wal.append(entry_type, payload);
+            const entry_len = @sizeOf(EntryHeader) + payload.len;
+            self.global_offset += entry_len;
+            if (self.wal.write_offset >= self.segment_size) {
+                try self.rotate();
+            }
+        }
+
+        pub fn sync(self: *Self) !void {
+            try self.wal.sync();
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.wal.deinit();
+        }
+
+        /// Raw bytes of the current segment file. For VOPR invariant checks.
+        pub fn current_file(self: *const Self) StorageT.FileT {
+            return self.wal.file;
+        }
+
+        // ---- Internal ----
+
+        fn dir(self: *const Self) []const u8 {
+            return self.dir_path[0..self.dir_path_len];
+        }
+
+        fn rotate(self: *Self) !void {
+            self.wal.sync() catch {};
+            self.wal.deinit();
+            self.segment_index += 1;
+            self.wal = try open_segment(
+                self.storage,
+                self.dir(),
+                self.segment_index,
+                self.segment_size,
+                self.wal.last_crc,
+            );
+        }
+
+        fn open_segment(storage: *StorageT, d: []const u8, index: u32, seg_size: u64, prev_crc: u32) !InnerWal {
+            var path_buf: [512]u8 = undefined;
+            const path = try segment_filename(d, index, &path_buf);
+            const f = try storage.open_rw(path);
+            errdefer f.close();
+            storage.fallocate(f, seg_size) catch {};
+            try f.seek_to(0);
+            var wal = InnerWal.init_with_file(f, 0);
+            wal.last_crc = prev_crc;
+            return wal;
+        }
+
+        // ---- Open and Recover ----
+
+        pub fn open(storage: *StorageT, d: []const u8, seg_size: u64, alloc: std.mem.Allocator) !Self {
+            try storage.make_path(d);
+
+            // Find existing segment indices.
+            var indices: std.ArrayList(u32) = .empty;
+            defer indices.deinit(alloc);
+            storage.list_segment_indices(d, &indices, alloc) catch {};
+
+            if (indices.items.len == 0) {
+                var result = Self{
+                    .wal           = try open_segment(storage, d, 0, seg_size, 0),
+                    .storage       = storage,
                     .segment_index = 0,
-                    .segment_size  = segment_size,
+                    .segment_size  = seg_size,
                     .global_offset = 0,
                     .dir_path      = undefined,
-                    .dir_path_len  = @intCast(dir.len),
+                    .dir_path_len  = @intCast(d.len),
                 };
-                @memcpy(result.dir_path[0..dir.len], dir);
+                @memcpy(result.dir_path[0..d.len], d);
                 return result;
-            },
-            else => return err,
-        };
-        defer disk_io.close_dir(dfd);
+            }
 
-        var it = disk_io.DirIter.init(dfd);
-        while (try it.next()) |name| {
-            if (name.len == 14 and std.mem.startsWith(u8, name, "seg_") and
-                std.mem.endsWith(u8, name, ".log"))
-            {
-                const idx = std.fmt.parseInt(u32, name[4..10], 10) catch continue;
-                if (!found or idx > max_index) {
-                    max_index = idx;
-                    found = true;
+            std.mem.sort(u32, indices.items, {}, std.sort.asc(u32));
+            const max_index = indices.items[indices.items.len - 1];
+
+            // Walk CRC chain across all segments to find prev_crc and data sizes.
+            var prev_crc: u32 = 0;
+            var total_bytes: u64 = 0;
+            var last_seg_data_size: u64 = 0;
+
+            for (indices.items) |idx| {
+                var path_buf: [512]u8 = undefined;
+                const path = segment_filename(d, idx, &path_buf) catch continue;
+                const file = storage.open_ro(path) catch continue;
+                defer file.close();
+
+                const file_size = file.size() catch continue;
+                if (file_size == 0) continue;
+
+                const data = alloc.alloc(u8, @intCast(file_size)) catch continue;
+                defer alloc.free(data);
+                var read_total: usize = 0;
+                while (read_total < data.len) {
+                    const n = file.read(data[read_total..]) catch break;
+                    if (n == 0) break;
+                    read_total += n;
+                }
+
+                var pos: usize = 0;
+                while (pos + @sizeOf(EntryHeader) <= read_total) {
+                    var header: EntryHeader = undefined;
+                    @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
+                    if (header.prev_crc != prev_crc) break;
+                    _ = std.enums.fromInt(EntryType, header.entry_type) orelse break;
+                    const payload_end = pos + @sizeOf(EntryHeader) + header.payload_len;
+                    if (payload_end > read_total) break;
+                    const payload = data[pos + @sizeOf(EntryHeader) .. payload_end];
+                    if (std.hash.Crc32.hash(payload) != header.payload_crc) break;
+
+                    var h = std.hash.Crc32.init();
+                    h.update(std.mem.asBytes(&header));
+                    h.update(payload);
+                    prev_crc = h.final();
+                    pos = payload_end;
+                }
+
+                last_seg_data_size = pos;
+                total_bytes += pos;
+            }
+
+            // Open last segment for appending.
+            var path_buf: [512]u8 = undefined;
+            const last_path = try segment_filename(d, max_index, &path_buf);
+            const rf = try storage.open_rw(last_path);
+            errdefer rf.close();
+            try rf.seek_to(last_seg_data_size);
+
+            var result = Self{
+                .wal           = InnerWal.init_with_file(rf, last_seg_data_size),
+                .storage       = storage,
+                .segment_index = max_index,
+                .segment_size  = seg_size,
+                .global_offset = total_bytes,
+                .dir_path      = undefined,
+                .dir_path_len  = @intCast(d.len),
+            };
+            result.wal.last_crc = prev_crc;
+            @memcpy(result.dir_path[0..d.len], d);
+            return result;
+        }
+
+        pub fn recover(storage: *StorageT, d: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntry {
+            var indices: std.ArrayList(u32) = .empty;
+            defer indices.deinit(alloc);
+            storage.list_segment_indices(d, &indices, alloc) catch return &[_]RecoveryEntry{};
+
+            if (indices.items.len == 0) return &[_]RecoveryEntry{};
+            std.mem.sort(u32, indices.items, {}, std.sort.asc(u32));
+
+            var all_entries: std.ArrayList(RecoveryEntry) = .empty;
+            errdefer {
+                for (all_entries.items) |e| alloc.free(e.payload);
+                all_entries.deinit(alloc);
+            }
+            var prev_crc: u32 = 0;
+
+            for (indices.items) |idx| {
+                var path_buf: [512]u8 = undefined;
+                const path = segment_filename(d, idx, &path_buf) catch continue;
+                const file = storage.open_ro(path) catch continue;
+                defer file.close();
+
+                const sz = file.size() catch continue;
+                if (sz == 0) continue;
+
+                const data = alloc.alloc(u8, @intCast(sz)) catch continue;
+                defer alloc.free(data);
+                var total: usize = 0;
+                while (total < data.len) {
+                    const n = file.read(data[total..]) catch break;
+                    if (n == 0) break;
+                    total += n;
+                }
+
+                var pos: usize = 0;
+                while (pos + @sizeOf(EntryHeader) <= total) {
+                    var header: EntryHeader = undefined;
+                    @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
+                    if (header.prev_crc != prev_crc) break;
+                    const entry_type = std.enums.fromInt(EntryType, header.entry_type) orelse break;
+                    pos += @sizeOf(EntryHeader);
+                    if (pos + header.payload_len > total) break;
+                    const payload_slice = data[pos .. pos + header.payload_len];
+                    if (std.hash.Crc32.hash(payload_slice) != header.payload_crc) break;
+
+                    const payload = alloc.dupe(u8, payload_slice) catch break;
+                    var h = std.hash.Crc32.init();
+                    h.update(std.mem.asBytes(&header));
+                    h.update(payload_slice);
+                    prev_crc = h.final();
+                    pos += header.payload_len;
+
+                    all_entries.append(alloc, .{
+                        .entry_type = entry_type,
+                        .payload    = payload,
+                    }) catch break;
                 }
             }
+
+            return all_entries.toOwnedSlice(alloc);
         }
-    }
-
-    if (!found) {
-        var result = SegmentedWal{
-            .wal           = try open_wal_segment(dir, 0, segment_size, 0),
-            .segment_index = 0,
-            .segment_size  = segment_size,
-            .global_offset = 0,
-            .dir_path      = undefined,
-            .dir_path_len  = @intCast(dir.len),
-        };
-        @memcpy(result.dir_path[0..dir.len], dir);
-        return result;
-    }
-
-    // Use recover_segmented to walk the CRC chain across all segments.
-    // This gives us prev_crc and total data size without duplicating scan logic.
-    // Temporary allocation — freed after extracting CRC and sizes.
-    var tmp_gpa = std.heap.DebugAllocator(.{}){};
-    const tmp_alloc = tmp_gpa.allocator();
-    defer _ = tmp_gpa.deinit();
-
-    var prev_crc: u32 = 0;
-    var total_bytes: u64 = 0;
-    var last_seg_data_size: u64 = 0;
-
-    // Walk each segment individually to compute per-segment data sizes.
-    var seg_idx: u32 = 0;
-    while (seg_idx <= max_index) : (seg_idx += 1) {
-        var path_buf: [512]u8 = undefined;
-        const path = segment_filename(dir, seg_idx, &path_buf) catch continue;
-        const file = disk_io.open_ro(path) catch continue;
-        defer file.close();
-
-        const file_size = file.size() catch continue;
-        if (file_size == 0) continue;
-
-        const data = tmp_alloc.alloc(u8, @intCast(file_size)) catch continue;
-        defer tmp_alloc.free(data);
-        var read_total: usize = 0;
-        while (read_total < data.len) {
-            const n = file.read(data[read_total..]) catch break;
-            if (n == 0) break;
-            read_total += n;
-        }
-
-        // Walk CRC chain to find data end in this segment.
-        var pos: usize = 0;
-        while (pos + @sizeOf(EntryHeader) <= read_total) {
-            var header: EntryHeader = undefined;
-            @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
-            if (header.prev_crc != prev_crc) break;
-            _ = std.enums.fromInt(EntryType, header.entry_type) orelse break;
-
-            const payload_end = pos + @sizeOf(EntryHeader) + header.payload_len;
-            if (payload_end > read_total) break;
-            const payload = data[pos + @sizeOf(EntryHeader) .. payload_end];
-            if (std.hash.Crc32.hash(payload) != header.payload_crc) break;
-
-            var h = std.hash.Crc32.init();
-            h.update(std.mem.asBytes(&header));
-            h.update(payload);
-            prev_crc = h.final();
-
-            pos = payload_end;
-        }
-
-        last_seg_data_size = pos;
-        total_bytes += pos;
-    }
-
-    // Open the last segment for appending at the data end.
-    var path_buf: [512]u8 = undefined;
-    const last_path = try segment_filename(dir, max_index, &path_buf);
-    const rf = try disk_io.open_rw(last_path);
-    errdefer rf.close();
-    try rf.seek_to(last_seg_data_size);
-
-    var result = SegmentedWal{
-        .wal           = Wal.init_with_file(rf, last_seg_data_size),
-        .segment_index = max_index,
-        .segment_size  = segment_size,
-        .global_offset = total_bytes,
-        .dir_path      = undefined,
-        .dir_path_len  = @intCast(dir.len),
     };
-    result.wal.last_crc = prev_crc;
-    @memcpy(result.dir_path[0..dir.len], dir);
-    return result;
 }
 
-/// Recover all entries from a segmented WAL directory.
+// Convenience wrappers for production (backward compat with callers).
+pub fn wal_open_segmented(dir: []const u8, segment_size: u64) !SegmentedWal {
+    var storage = RealStorage{};
+    // Use DebugAllocator for CRC scan during open (freed after).
+    var tmp_gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = tmp_gpa.deinit();
+    return SegmentedWal.open(&storage, dir, segment_size, tmp_gpa.allocator());
+}
+
 pub fn recover_segmented(dir: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntry {
-    // Collect and sort segment files.
-    var indices: std.ArrayList(u32) = .empty;
-    defer indices.deinit(alloc);
-
-    const dfd = disk_io.open_dir(dir) catch |err| switch (err) {
-        error.FileNotFound => return &[_]RecoveryEntry{},
-        else => return err,
-    };
-    {
-        defer disk_io.close_dir(dfd);
-        var it = disk_io.DirIter.init(dfd);
-        while (try it.next()) |name| {
-            if (name.len == 14 and std.mem.startsWith(u8, name, "seg_") and
-                std.mem.endsWith(u8, name, ".log"))
-            {
-                const idx = std.fmt.parseInt(u32, name[4..10], 10) catch continue;
-                try indices.append(alloc, idx);
-            }
-        }
-    }
-
-    if (indices.items.len == 0) return &[_]RecoveryEntry{};
-
-    std.mem.sort(u32, indices.items, {}, std.sort.asc(u32));
-
-    // Recover each segment separately, carrying prev_crc across boundaries.
-    // Cannot concatenate files because pre-allocated segments have trailing zeros.
-    var all_entries: std.ArrayList(RecoveryEntry) = .empty;
-    errdefer {
-        for (all_entries.items) |e| alloc.free(e.payload);
-        all_entries.deinit(alloc);
-    }
-    var prev_crc: u32 = 0;
-
-    for (indices.items) |idx| {
-        var path_buf: [512]u8 = undefined;
-        const path = segment_filename(dir, idx, &path_buf) catch continue;
-        const file = disk_io.open_ro(path) catch continue;
-        defer file.close();
-        const sz = file.size() catch continue;
-        if (sz == 0) continue;
-
-        const data = alloc.alloc(u8, @intCast(sz)) catch continue;
-        defer alloc.free(data);
-        var total: usize = 0;
-        while (total < @as(usize, @intCast(sz))) {
-            const n = file.read(data[total..]) catch break;
-            if (n == 0) break;
-            total += n;
-        }
-
-        // Walk CRC chain within this segment, starting from prev_crc.
-        var pos: usize = 0;
-        while (pos + @sizeOf(EntryHeader) <= total) {
-            var header: EntryHeader = undefined;
-            @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
-            if (header.prev_crc != prev_crc) break;
-
-            const entry_type = std.enums.fromInt(EntryType, header.entry_type) orelse break;
-            pos += @sizeOf(EntryHeader);
-
-            if (pos + header.payload_len > total) break;
-            const payload_slice = data[pos .. pos + header.payload_len];
-            if (std.hash.Crc32.hash(payload_slice) != header.payload_crc) break;
-
-            const payload = alloc.dupe(u8, payload_slice) catch break;
-            errdefer alloc.free(payload);
-
-            var h = std.hash.Crc32.init();
-            h.update(std.mem.asBytes(&header));
-            h.update(payload_slice);
-            prev_crc = h.final();
-            pos += header.payload_len;
-
-            all_entries.append(alloc, .{
-                .entry_type = entry_type,
-                .payload    = payload,
-            }) catch break;
-        }
-    }
-
-    return all_entries.toOwnedSlice(alloc);
+    var storage = RealStorage{};
+    return SegmentedWal.recover(&storage, dir, alloc);
 }
 
 // ---- Recovery ----
@@ -465,7 +461,6 @@ pub const RecoveryEntry = struct {
 };
 
 /// Parse all valid entries from a raw byte buffer, stopping at the first corrupt entry.
-/// Allows VOPR to test recovery on arbitrary (possibly corrupted) data without disk I/O.
 pub fn recover_bytes(data: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntry {
     var entries: std.ArrayList(RecoveryEntry) = .empty;
     errdefer {
@@ -479,16 +474,14 @@ pub fn recover_bytes(data: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntr
     while (pos + @sizeOf(EntryHeader) <= data.len) {
         var header: EntryHeader = undefined;
         @memcpy(std.mem.asBytes(&header), data[pos .. pos + @sizeOf(EntryHeader)]);
-        if (header.prev_crc != prev_crc) break; // chain broken
+        if (header.prev_crc != prev_crc) break;
 
-        // Validate entry_type before converting (pre-allocated files contain zeros).
         const entry_type = std.enums.fromInt(EntryType, header.entry_type) orelse break;
-
         pos += @sizeOf(EntryHeader);
 
-        if (pos + header.payload_len > data.len) break; // truncated payload
+        if (pos + header.payload_len > data.len) break;
         const payload_slice = data[pos .. pos + header.payload_len];
-        if (std.hash.Crc32.hash(payload_slice) != header.payload_crc) break; // corrupt payload
+        if (std.hash.Crc32.hash(payload_slice) != header.payload_crc) break;
 
         const payload = try alloc.dupe(u8, payload_slice);
         errdefer alloc.free(payload);
@@ -508,8 +501,7 @@ pub fn recover_bytes(data: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntr
     return entries.toOwnedSlice(alloc);
 }
 
-/// Read all valid entries from a WAL file, stopping at the first corrupt entry.
-/// Returns an empty slice if the file does not exist.
+/// Read all valid entries from a single WAL file.
 pub fn recover(path: []const u8, alloc: std.mem.Allocator) ![]RecoveryEntry {
     const file = disk_io.open_ro(path) catch |err| switch (err) {
         error.FileNotFound => return &[_]RecoveryEntry{},

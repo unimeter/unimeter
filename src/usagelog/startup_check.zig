@@ -39,12 +39,9 @@ pub fn validate(alloc: std.mem.Allocator, data_dir: []const u8) !ValidateResult 
     var wal_dir_buf: [512]u8 = undefined;
     const wal_dir = try std.fmt.bufPrint(&wal_dir_buf, "{s}/wal", .{data_dir});
 
-    const entries = wal_mod.recover_segmented(wal_dir, alloc) catch |err| switch (err) {
-        error.FileNotFound => {
-            log.info("no WAL found, fresh start", .{});
-            return result;
-        },
-        else => return err,
+    const entries = wal_mod.recover_segmented(wal_dir, alloc) catch |err| {
+        log.warn("WAL recovery error: {}", .{err});
+        return result;
     };
     defer {
         for (entries) |e| alloc.free(e.payload);
