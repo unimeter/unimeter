@@ -25,16 +25,20 @@ pub fn update(agg: *AggValue, event: *const Event, agg_type: AggType) void {
         },
         .sum => {
             agg.sum += @as(u128, event.value);
+            agg.count += 1;
         },
         .max => {
             agg.max = @max(agg.max, event.value);
+            agg.count += 1;
         },
         .latest => {
-            // Late events (older timestamp) must not overwrite a newer reading.
+            // Late events (older timestamp) must not overwrite a newer reading,
+            // but they were still processed — count them either way.
             if (event.timestamp > agg.last_timestamp) {
                 agg.last_value     = event.value;
                 agg.last_timestamp = event.timestamp;
             }
+            agg.count += 1;
         },
         .count_unique => {
             // Deferred to caller: UniqueSets.update() + agg.count = set.count().
@@ -178,6 +182,24 @@ test "aggregators: latest ignores older events" {
     update(&agg, &older, .latest); // must not overwrite
     try std.testing.expectEqual(@as(u64, 999), agg.last_value);
     try std.testing.expectEqual(@as(i64, 3000), agg.last_timestamp);
+}
+
+test "aggregators: count is tracked for SUM/MAX/LATEST" {
+    var sum_agg = AggValue{};
+    update(&sum_agg, &make_event(1, 100, 1), .sum);
+    update(&sum_agg, &make_event(2, 200, 2), .sum);
+    update(&sum_agg, &make_event(3, 300, 3), .sum);
+    try std.testing.expectEqual(@as(u64, 3), sum_agg.count);
+
+    var max_agg = AggValue{};
+    update(&max_agg, &make_event(1, 100, 1), .max);
+    update(&max_agg, &make_event(2, 50, 2), .max);
+    try std.testing.expectEqual(@as(u64, 2), max_agg.count);
+
+    var latest_agg = AggValue{};
+    update(&latest_agg, &make_event(10, 100, 1), .latest); // newer
+    update(&latest_agg, &make_event(5,  200, 2), .latest); // late, doesn't win
+    try std.testing.expectEqual(@as(u64, 2), latest_agg.count);
 }
 
 test "aggregators: last_seg_offset tracks maximum" {
