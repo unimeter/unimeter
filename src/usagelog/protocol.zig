@@ -40,6 +40,7 @@ pub const PacketType = enum(u8) {
     alerts_list       = 0x33, // → []AlertRecordWire (136B each)
     alert_push_enable = 0x34, // client→server, empty payload; flips wants_alerts on conn
     alert_push        = 0x35, // server→client, request_id=0; payload = AlertPushPayload (145B)
+    usage_query_breakdown = 0x36, // → []BreakdownEntryWire; one per non-empty (dims) combination
     cluster_status    = 0x40, // → ClusterStatusPayload (40B header + 256×8B partitions)
     cluster_rebalance = 0x41, // trigger rebalance; payload: new_node_count:u8
     transfer_start    = 0x42, // begin partition state transfer
@@ -138,6 +139,28 @@ pub const AlertPushPayload = extern struct {
 comptime { std.debug.assert(@sizeOf(AlertPushPayload) == 144); }
 
 pub const ALERT_PUSH_PAYLOAD_SIZE: usize = 144;
+
+/// One row in a USAGE_QUERY_BREAKDOWN response. 320 bytes.
+/// dims_count tells the client how many of the (key, value) slots in
+/// dim_keys/dim_values carry real data; the rest are zero-padded.
+/// Schema's MAX_FILTERS = 4, so 4 slots is always enough.
+pub const BreakdownEntryWire = extern struct {
+    dims_count:  u8,
+    _pad:        [7]u8 = [_]u8{0} ** 7,
+    dim_keys:    [4][32]u8,
+    dim_values:  [4][32]u8,
+    agg_sum_lo:  u64,
+    agg_sum_hi:  u64,
+    agg_count:   u64,
+    agg_max:     u64,
+    last_value:  u64,
+    last_ts:     i64,
+    alert_flags: u64,
+};
+
+comptime { std.debug.assert(@sizeOf(BreakdownEntryWire) == 320); }
+
+pub const BREAKDOWN_ENTRY_WIRE_SIZE: usize = 320;
 
 pub fn validate_header(hdr: *const RequestHeader) bool {
     return hdr.magic == MAGIC and hdr.version == VERSION;

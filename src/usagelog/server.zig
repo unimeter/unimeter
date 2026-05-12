@@ -850,6 +850,7 @@ fn dispatch_packet(io: *RealIO, log: *UsageLog, conn: *Conn) !void {
         .metric_delete               => try handle_metric_delete(io, log, conn),
         .metric_list                 => try handle_metric_list(io, log, conn),
         .usage_query                 => try handle_usage_query(io, conn),
+        .usage_query_breakdown       => try handle_usage_query_breakdown(io, conn),
         .usage_realtime              => try handle_usage_realtime(io, conn),
         .events_list                 => try handle_events_list(io, log, conn),
         .alerts_list                 => try handle_alerts_list(io, log, conn),
@@ -1466,6 +1467,149 @@ fn handle_usage_query(io: *RealIO, conn: *Conn) !void {
 
     write_agg_value_wire(conn, &merged);
     write_resp_hdr(conn, .ok, proto.AGG_VALUE_WIRE_SIZE);
+    try queue_send_resp(io, conn);
+}
+
+/// USAGE_QUERY_BREAKDOWN: enumerate every combination of declared
+/// dimension values for the requested group_by keys, compute the
+/// aggregate for each, and return only the non-empty ones.
+///
+/// Payload (variable size):
+///   account_id:u64 + period_start:i64 + period_end:i64 +
+///   metric_code:[64]u8 + group_by_count:u8 + _pad:[7]u8 +
+///   group_by_keys: group_by_count × [32]u8
+fn handle_usage_query_breakdown(io: *RealIO, conn: *Conn) !void {
+    const BASE_SIZE = 96;
+    if (conn.hdr.payload_len < BASE_SIZE) return send_error(io, conn);
+
+    const payload = conn.body[0..conn.hdr.payload_len];
+    const account_id     = std.mem.readInt(u64, payload[0..8], .little);
+    const period_start   = std.mem.readInt(i64, payload[8..16], .little);
+    const period_end     = std.mem.readInt(i64, payload[16..24], .little);
+    const metric_code_str = payload[24..88];
+    const metric_code    = metric_registry.fnv1a(std.mem.sliceTo(metric_code_str, 0));
+    const group_by_count: u8 = payload[88];
+
+    if (group_by_count == 0 or group_by_count > metric_registry.MAX_FILTERS) {
+        return send_error(io, conn);
+    }
+    const required_len = BASE_SIZE + @as(usize, group_by_count) * 32;
+    if (payload.len < required_len) return send_error(io, conn);
+
+    const schema = if (g_memtable_init) g_agg_worker.registry.get(metric_code) else null;
+    if (schema == null) return send_error(io, conn);
+    const s = schema.?;
+
+    // Resolve each requested group_by key to its DimensionFilter in the
+    // schema. Order of dim_indices matches the request, so the response
+    // keys appear in caller-visible order.
+    var dim_indices: [metric_registry.MAX_FILTERS]u8 = undefined;
+    for (0..group_by_count) |gi| {
+        const key_off = BASE_SIZE + gi * 32;
+        const requested = std.mem.sliceTo(payload[key_off..key_off + 32], 0);
+        var found: ?u8 = null;
+        for (0..s.filter_count) |fi| {
+            const schema_key = std.mem.sliceTo(&s.filters[fi].key, 0);
+            if (std.mem.eql(u8, requested, schema_key)) {
+                found = @intCast(fi);
+                break;
+            }
+        }
+        if (found == null) return send_error(io, conn);
+        dim_indices[gi] = found.?;
+    }
+
+    // Resolve period range once, exclusive end (mirrors usage_query).
+    const pid_start = aggregators.resolve_period_id(period_start, s.period_type, s.period_ns, s.billing_cycle_day);
+    const query_end_inclusive = if (period_end > period_start) period_end - 1 else period_start;
+    const pid_end = aggregators.resolve_period_id(query_end_inclusive, s.period_type, s.period_ns, s.billing_cycle_day);
+
+    // Output begins right after the response header. Each entry is
+    // BREAKDOWN_ENTRY_WIRE_SIZE bytes; we cap the response at whatever
+    // fits in MAX_BODY_LEN so a pathological 8^4 = 4096-combo request
+    // cannot blow the buffer.
+    const max_entries = (MAX_BODY_LEN - RESP_HDR_SIZE) / proto.BREAKDOWN_ENTRY_WIRE_SIZE;
+    var entry_count: u32 = 0;
+
+    // Cartesian product over selected dimensions. Iterate by an N-digit
+    // odometer where digit i ranges over s.filters[dim_indices[i]].value_count.
+    var indices: [metric_registry.MAX_FILTERS]u8 = .{ 0, 0, 0, 0 };
+    var done = false;
+
+    // Edge case: any selected dim has zero values — nothing to enumerate.
+    for (0..group_by_count) |gi| {
+        if (s.filters[dim_indices[gi]].value_count == 0) done = true;
+    }
+
+    while (!done and entry_count < max_entries) {
+        // Compute filter_hash for the current combo.
+        var filter_hash: u64 = 0;
+        for (0..group_by_count) |gi| {
+            const f = &s.filters[dim_indices[gi]];
+            const key_str = std.mem.sliceTo(&f.key, 0);
+            const val_str = std.mem.sliceTo(&f.values[indices[gi]], 0);
+            filter_hash ^= metric_registry.fnv1a(key_str) ^ metric_registry.fnv1a(val_str);
+        }
+
+        // Merge across the period bucket range.
+        var merged = AggValue{};
+        var pid: u32 = pid_start;
+        while (pid <= pid_end) : (pid += 1) {
+            const key = AggKey{
+                .account_id  = account_id,
+                .period_id   = pid,
+                .metric_code = metric_code,
+                .filter_hash = filter_hash,
+            };
+            if (g_memtable.get(key)) |v| {
+                merged.sum   += v.sum;
+                merged.count += v.count;
+                merged.max    = @max(merged.max, v.max);
+                if (v.last_timestamp > merged.last_timestamp) {
+                    merged.last_value     = v.last_value;
+                    merged.last_timestamp = v.last_timestamp;
+                }
+                merged.alert_flags |= v.alert_flags;
+            }
+        }
+
+        // Skip empty cells — the whole point of this API is sparse output.
+        if (merged.sum != 0 or merged.count != 0 or merged.max != 0 or merged.alert_flags != 0) {
+            const entry_off = RESP_HDR_SIZE + entry_count * proto.BREAKDOWN_ENTRY_WIRE_SIZE;
+            var entry: proto.BreakdownEntryWire = .{
+                .dims_count  = group_by_count,
+                .dim_keys    = std.mem.zeroes([4][32]u8),
+                .dim_values  = std.mem.zeroes([4][32]u8),
+                .agg_sum_lo  = @truncate(merged.sum),
+                .agg_sum_hi  = @truncate(merged.sum >> 64),
+                .agg_count   = merged.count,
+                .agg_max     = merged.max,
+                .last_value  = merged.last_value,
+                .last_ts     = merged.last_timestamp,
+                .alert_flags = merged.alert_flags,
+            };
+            for (0..group_by_count) |gi| {
+                entry.dim_keys[gi]   = s.filters[dim_indices[gi]].key;
+                entry.dim_values[gi] = s.filters[dim_indices[gi]].values[indices[gi]];
+            }
+            @memcpy(conn.body[entry_off..entry_off + proto.BREAKDOWN_ENTRY_WIRE_SIZE],
+                    std.mem.asBytes(&entry));
+            entry_count += 1;
+        }
+
+        // Advance odometer.
+        var carry: usize = group_by_count;
+        while (carry > 0) {
+            carry -= 1;
+            indices[carry] += 1;
+            if (indices[carry] < s.filters[dim_indices[carry]].value_count) break;
+            indices[carry] = 0;
+            if (carry == 0) { done = true; break; }
+        }
+    }
+
+    const payload_len: u32 = @intCast(entry_count * proto.BREAKDOWN_ENTRY_WIRE_SIZE);
+    write_resp_hdr(conn, .ok, payload_len);
     try queue_send_resp(io, conn);
 }
 
