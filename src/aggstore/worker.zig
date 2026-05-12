@@ -32,6 +32,7 @@ const UniqueSets  = @import("unique_sets.zig").UniqueSets;
 const aggregators = @import("aggregators.zig");
 const watermark   = @import("watermark.zig");
 const alert       = @import("alert.zig");
+const metrics     = @import("../metrics/metrics.zig");
 const AlertLog    = alert.AlertLog;
 
 /// 30-day approximate billing period (nanoseconds).
@@ -179,6 +180,13 @@ pub const AggWorker = struct {
                 }
             }
         }
+
+        // Refresh the agg-keys / memtable-bytes gauges once per batch.
+        // sizeof(AggKey)=32 + sizeof(AggValue)=64 = 96 bytes of data per row,
+        // not counting HashMap metadata.
+        const keys = self.memtable.count();
+        metrics.agg_keys_total.set(@intCast(keys));
+        metrics.memtable_bytes.set(@intCast(keys * 96));
     }
 
     /// Apply one event with its associated properties.

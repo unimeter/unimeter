@@ -25,6 +25,9 @@ pub var connections_active:      Gauge = .{}; // active ingest TCP connections
 pub var http_connections_active: Gauge = .{}; // active HTTP connections
 pub var wal_offset_bytes:        Gauge = .{}; // current WAL write offset in bytes
 pub var alert_subscribers:       Gauge = .{}; // connections with wants_alerts=true
+pub var agg_keys_total:          Gauge = .{}; // live (account × period × metric × filter_hash) keys in memtable
+pub var memtable_bytes:          Gauge = .{}; // approximate memtable data footprint (excludes HashMap metadata)
+pub var checkpoint_bytes:        Gauge = .{}; // size on disk of the most recent checkpoint file
 
 // ---- Histograms ----
 

@@ -91,6 +91,24 @@ pub fn render(buf: []u8) ![]u8 {
     try wf(buf, &pos, "billing_alert_subscribers {d}\n",
         .{metrics.alert_subscribers.get()});
 
+    try wf(buf, &pos,
+        "# HELP billing_agg_keys_total Live aggregate keys in memtable\n" ++
+        "# TYPE billing_agg_keys_total gauge\n", .{});
+    try wf(buf, &pos, "billing_agg_keys_total {d}\n",
+        .{metrics.agg_keys_total.get()});
+
+    try wf(buf, &pos,
+        "# HELP billing_memtable_bytes Approximate memtable data footprint in bytes (excludes HashMap metadata)\n" ++
+        "# TYPE billing_memtable_bytes gauge\n", .{});
+    try wf(buf, &pos, "billing_memtable_bytes {d}\n",
+        .{metrics.memtable_bytes.get()});
+
+    try wf(buf, &pos,
+        "# HELP billing_checkpoint_bytes Size of the most recent checkpoint file on disk\n" ++
+        "# TYPE billing_checkpoint_bytes gauge\n", .{});
+    try wf(buf, &pos, "billing_checkpoint_bytes {d}\n",
+        .{metrics.checkpoint_bytes.get()});
+
     // ---- Histograms ----
 
     try render_histogram(buf, &pos,

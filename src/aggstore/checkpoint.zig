@@ -16,6 +16,7 @@ const AggKey   = @import("memtable.zig").AggKey;
 const AggValue = @import("memtable.zig").AggValue;
 const Memtable = @import("memtable.zig").Memtable;
 const UniqueSets = @import("unique_sets.zig").UniqueSets;
+const metrics  = @import("../metrics/metrics.zig");
 
 pub const MAGIC:   u32 = 0xACC10001; // ACC = aggregate checkpoint
 pub const VERSION: u8  = 1;
@@ -90,6 +91,10 @@ pub fn save(alloc: std.mem.Allocator, memtable: *const Memtable, last_seg_offset
     }
 
     try disk_io.rename(tmp_path, path);
+
+    // 64B header + N × 96B entries. Cheaper than stat() and identical.
+    const file_bytes: i64 = @intCast(@sizeOf(CheckpointHeader) + n * @sizeOf(CheckpointEntry));
+    metrics.checkpoint_bytes.set(file_bytes);
 }
 
 /// Result of loading a checkpoint.
