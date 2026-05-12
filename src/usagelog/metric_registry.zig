@@ -49,6 +49,7 @@ pub const MAX_FILTERS: u8 = 4;
 pub const PeriodType = enum(u8) {
     fixed    = 0, // floor(timestamp_ns / period_ns)
     calendar = 1, // calendar month with optional billing_cycle_day offset
+    day      = 2, // UTC day buckets (86400s); ignores period_ns and billing_cycle_day
 };
 
 /// Fixed-size schema record. 1704 bytes.

@@ -91,7 +91,10 @@ pub fn calendar_period_id_of(timestamp_ns: i64, billing_cycle_day: u8) u32 {
     return @intCast(base);
 }
 
-/// Unified period_id dispatch: fixed or calendar based on period_type.
+/// One UTC day in nanoseconds.
+pub const DAY_NS: i64 = 24 * 3600 * std.time.ns_per_s;
+
+/// Unified period_id dispatch: fixed, calendar, or day based on period_type.
 pub fn resolve_period_id(timestamp_ns: i64, period_type: u8, period_ns: u64, billing_cycle_day: u8) u32 {
     const MetricRegistry = @import("../usagelog/metric_registry.zig");
     const pt = std.enums.fromInt(MetricRegistry.PeriodType, period_type);
@@ -99,6 +102,7 @@ pub fn resolve_period_id(timestamp_ns: i64, period_type: u8, period_ns: u64, bil
         return switch (p) {
             .fixed => period_id_of(timestamp_ns, if (period_ns > 0) @intCast(period_ns) else @as(i64, 30 * 24 * 3600 * std.time.ns_per_s)),
             .calendar => calendar_period_id_of(timestamp_ns, billing_cycle_day),
+            .day => period_id_of(timestamp_ns, DAY_NS),
         };
     }
     // Unknown period_type — fall back to fixed.
@@ -194,6 +198,17 @@ test "aggregators: period_id_of" {
     try std.testing.expectEqual(@as(u32, 1), period_id_of(day_ns, day_ns));
     try std.testing.expectEqual(@as(u32, 1), period_id_of(day_ns + 1, day_ns));
     try std.testing.expectEqual(@as(u32, 2), period_id_of(2 * day_ns, day_ns));
+}
+
+test "resolve_period_id: day buckets ignore period_ns" {
+    const day = @as(u8, 2); // PeriodType.day
+    const just_before_midnight: i64 = DAY_NS - 1;
+    const just_after_midnight: i64 = DAY_NS;
+    // period_ns and billing_cycle_day are ignored for .day
+    try std.testing.expectEqual(@as(u32, 0), resolve_period_id(0,                    day, 999, 99));
+    try std.testing.expectEqual(@as(u32, 0), resolve_period_id(just_before_midnight, day, 999, 99));
+    try std.testing.expectEqual(@as(u32, 1), resolve_period_id(just_after_midnight,  day, 999, 99));
+    try std.testing.expectEqual(@as(u32, 7), resolve_period_id(7 * DAY_NS,           day, 0,   0));
 }
 
 test "aggregators: simd_sum_u64" {
