@@ -1436,7 +1436,12 @@ fn handle_usage_query(io: *RealIO, conn: *Conn) !void {
     if (g_memtable_init) {
         const schema = g_agg_worker.registry.get(metric_code);
         const pid_start = if (schema) |s| aggregators.resolve_period_id(period_start, s.period_type, s.period_ns, s.billing_cycle_day) else aggregators.period_id_of(period_start, worker_mod.DEFAULT_PERIOD_NS);
-        const pid_end = if (schema) |s| aggregators.resolve_period_id(period_end, s.period_type, s.period_ns, s.billing_cycle_day) else aggregators.period_id_of(period_end, worker_mod.DEFAULT_PERIOD_NS);
+        // Treat period_end as exclusive: shift by -1ns so a query
+        // ending exactly on a bucket boundary does not pull in the
+        // next bucket. Matches the half-open [start, end) convention
+        // returned by current_month() / today_utc() / etc.
+        const query_end_inclusive = if (period_end > period_start) period_end - 1 else period_start;
+        const pid_end = if (schema) |s| aggregators.resolve_period_id(query_end_inclusive, s.period_type, s.period_ns, s.billing_cycle_day) else aggregators.period_id_of(query_end_inclusive, worker_mod.DEFAULT_PERIOD_NS);
 
         var pid: u32 = pid_start;
         while (pid <= pid_end) : (pid += 1) {
