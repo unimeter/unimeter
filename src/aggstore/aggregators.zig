@@ -98,7 +98,15 @@ pub fn calendar_period_id_of(timestamp_ns: i64, billing_cycle_day: u8) u32 {
 /// One UTC day in nanoseconds.
 pub const DAY_NS: i64 = 24 * 3600 * std.time.ns_per_s;
 
-/// Unified period_id dispatch: fixed, calendar, or day based on period_type.
+/// One ISO week in nanoseconds (7 days).
+pub const WEEK_NS: i64 = 7 * DAY_NS;
+
+/// Epoch (1970-01-01) was a Thursday; ISO weeks start on Monday.
+/// Shift timestamps by +3 days before the floor so week boundaries
+/// land on Monday 00:00 UTC.
+const MONDAY_ALIGN_OFFSET_NS: i64 = 3 * DAY_NS;
+
+/// Unified period_id dispatch.
 pub fn resolve_period_id(timestamp_ns: i64, period_type: u8, period_ns: u64, billing_cycle_day: u8) u32 {
     const MetricRegistry = @import("../usagelog/metric_registry.zig");
     const pt = std.enums.fromInt(MetricRegistry.PeriodType, period_type);
@@ -107,6 +115,7 @@ pub fn resolve_period_id(timestamp_ns: i64, period_type: u8, period_ns: u64, bil
             .fixed => period_id_of(timestamp_ns, if (period_ns > 0) @intCast(period_ns) else @as(i64, 30 * 24 * 3600 * std.time.ns_per_s)),
             .calendar => calendar_period_id_of(timestamp_ns, billing_cycle_day),
             .day => period_id_of(timestamp_ns, DAY_NS),
+            .week => period_id_of(timestamp_ns + MONDAY_ALIGN_OFFSET_NS, WEEK_NS),
         };
     }
     // Unknown period_type — fall back to fixed.
@@ -231,6 +240,24 @@ test "resolve_period_id: day buckets ignore period_ns" {
     try std.testing.expectEqual(@as(u32, 0), resolve_period_id(just_before_midnight, day, 999, 99));
     try std.testing.expectEqual(@as(u32, 1), resolve_period_id(just_after_midnight,  day, 999, 99));
     try std.testing.expectEqual(@as(u32, 7), resolve_period_id(7 * DAY_NS,           day, 0,   0));
+}
+
+test "resolve_period_id: week buckets align to Monday 00:00 UTC" {
+    const week = @as(u8, 3); // PeriodType.week
+    // 2024-01-01 00:00 UTC is a Monday → start of week id 2818.
+    const monday_2024_01_01_ns: i64 = 1_704_067_200 * std.time.ns_per_s;
+    // 2024-01-07 23:59:59 UTC is the last second of that same week.
+    const sunday_end_ns: i64 = monday_2024_01_01_ns + 7 * DAY_NS - 1;
+    // 2024-01-08 00:00 UTC is the next Monday → week id 2819.
+    const monday_2024_01_08_ns: i64 = monday_2024_01_01_ns + 7 * DAY_NS;
+
+    const w1 = resolve_period_id(monday_2024_01_01_ns, week, 0, 0);
+    try std.testing.expectEqual(w1, resolve_period_id(sunday_end_ns, week, 0, 0));
+    try std.testing.expectEqual(@as(u32, w1 + 1), resolve_period_id(monday_2024_01_08_ns, week, 0, 0));
+
+    // Unix epoch 1970-01-01 was a Thursday — falls in the week that started
+    // 1969-12-29 (Monday). That week is id 0 with our +3-day alignment.
+    try std.testing.expectEqual(@as(u32, 0), resolve_period_id(0, week, 0, 0));
 }
 
 test "aggregators: simd_sum_u64" {
