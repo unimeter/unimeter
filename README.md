@@ -16,8 +16,10 @@ Most usage metering setups require a message broker, a database, and a batch pip
 ## Quickstart
 
 ```bash
-docker build -t unimeter .
-docker run -d --name unimeter -p 7001:7001 -p 9090:9090 unimeter
+docker run -d --name unimeter \
+  --security-opt seccomp:unconfined \
+  -p 7001:7001 -p 9090:9090 \
+  ghcr.io/unimeter/unimeter:latest
 ```
 
 Install the Go or Python SDK, then:
@@ -46,7 +48,7 @@ usage, _ := client.Query(ctx, billing.QueryRequest{
 fmt.Println(usage.Value.Count) // 1
 ```
 
-See the [full quickstart](https://unimeter.io/quickstart/) for a step-by-step walkthrough.
+See the [full quickstart](https://unimeter.io/quickstart/) for a step-by-step walkthrough, or browse the [examples](https://github.com/unimeter/examples) for complete runnable scenarios in Go and Python.
 
 ## Features
 
@@ -86,7 +88,7 @@ Built-in Prometheus metrics endpoint with a Grafana dashboard and k6 load test s
 | Language | Repository | Install |
 |----------|-----------|---------|
 | Go | [unimeter/go-unimeter](https://github.com/unimeter/go-unimeter) | `go get github.com/unimeter/go-unimeter` |
-| Python | [unimeter/python-unimeter](https://github.com/unimeter/python-unimeter) | `pip install unimeter` |
+| Python | [unimeter/python-unimeter](https://github.com/unimeter/python-unimeter) | `pip install unimeter-python` |
 
 ## Building from source
 
@@ -116,6 +118,20 @@ Full documentation at [unimeter.io](https://unimeter.io):
 - [Python SDK](https://unimeter.io/sdk/python/)
 - [Cluster operations](https://unimeter.io/operations/cluster/)
 - [Stripe integration guide](https://unimeter.io/guides/stripe/)
+- [Benchmarks](https://unimeter.io/operations/benchmarks/)
+
+## Examples
+
+Complete, runnable examples in Go and Python: [unimeter/examples](https://github.com/unimeter/examples)
+
+| Example | Description |
+|---------|------------|
+| saas-api | API call counting and monthly usage query |
+| seat-based | COUNT_UNIQUE seats with add/remove |
+| infra-metering | Dimension filters, per-provider breakdown |
+| high-throughput | Buffered async ingest at high event rates |
+| free-tier-alerts | Alert thresholds and enforcement |
+| stripe-integration | Stripe webhook → usage → invoice |
 
 ## License
 
